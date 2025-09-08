@@ -617,10 +617,9 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
                 process(child, subg)
                 continue
 
-            # Only shape-like elements handled here
-            pts = element_to_polyline(child, density=density)
-            if not pts:
-                # copy unknowns as-is
+            # Only shape-like elements handled here (no geometry changes)
+            tagname = (tag.split('}')[-1]).lower()
+            if tagname in EXCLUDED_TAGS or tagname not in ALLOWED_TAGS:
                 parent_group.append(child)
                 continue
 
