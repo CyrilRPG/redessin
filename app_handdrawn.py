@@ -638,63 +638,33 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
             linecap = child.get("stroke-linecap","round")
             linejoin = child.get("stroke-linejoin","round")
 
-            # Zero-deformation strategy
+            # Zero-geometry overlays: duplicate element with style-only changes (no path edits)
             rng_local = np.random.default_rng(seed)
-            if is_closed_polyline(pts):
-                # Closed shapes: jittered paths but clipped inside the original outline to preserve silhouette
-                p1, p2 = jitter_pair_polylines(pts, amp=jitter, seed=seed, roughness=roughness, stroke_width=stroke_width, rigor=0.95)
-                if smooth_passes>0:
-                    p1 = chaikin_smooth(p1, passes=int(smooth_passes))
-                    p2 = chaikin_smooth(p2, passes=int(smooth_passes))
-                paths_ds = [polyline_to_pathd(p1), polyline_to_pathd(p2)]
-                if enable_extra_pass:
-                    p3_plus, p3_minus = jitter_pair_polylines(pts, amp=max(0.2, min(jitter3, jitter*0.5)), seed=seed+2, roughness=roughness, stroke_width=stroke_width, rigor=0.98)
-                    p3 = p3_plus if (seed % 2)==0 else p3_minus
-                    if smooth_passes>0:
-                        p3 = chaikin_smooth(p3, passes=int(smooth_passes))
-                    paths_ds.append(polyline_to_pathd(p3))
+            # Build clipPath that exactly duplicates the shape to constrain overlays inside
+            clip_id = f"clip_{abs(hash((child.tag, tuple(sorted(child.attrib.items())))))%10**8}"
+            cp = ET.SubElement(defs, f"{{{SVG_NS}}}clipPath", {"id": clip_id})
+            ET.SubElement(cp, child.tag, child.attrib)
+            erode_id = ensure_erode_filter(defs, radius=max(0.0, float(inset_px))) if inset_px>0 else None
 
-                # clip path from original polygon, with optional erosion via filter
-                d_clip = polyline_to_pathd(pts + [pts[0]])
-                clip_id = f"clip_safe_{abs(hash(d_clip))%10**8}"
-                cp = ET.SubElement(defs, f"{{{SVG_NS}}}clipPath", {"id": clip_id})
-                ET.SubElement(cp, f"{{{SVG_NS}}}path", {"d": d_clip})
-                # Erode filter id
-                erode_id = ensure_erode_filter(defs, radius=max(0.0, float(inset_px))) if inset_px>0 else None
-
-                for d in paths_ds:
-                    if not d:
-                        continue
-                    this_stroke = stroke_color if stroke_color else "#000"
-                    attribs = {
-                        "d": d,
-                        "fill": "none",
-                        "stroke": this_stroke,
-                        "stroke-width": str(stroke_width * (1.0 + float(rng_local.normal(0, max(0.0, stroke_variation))))),
-                        "stroke-linecap": linecap,
-                        "stroke-linejoin": linejoin,
-                        "opacity": "0.95",
-                        "clip-path": f"url(#{clip_id})"
-                    }
-                    if erode_id:
-                        attribs["filter"] = f"url(#{erode_id})"
-                    ET.SubElement(parent_group, f"{{{SVG_NS}}}path", attribs)
-            else:
-                # Open polylines/lines: never move geometry. Render multiple passes directly on original segments
-                base_d = polyline_to_pathd(pts)
-                for k in range(int(2 + (1 if enable_extra_pass else 0))):
-                    this_stroke = stroke_color if stroke_color else "#000"
-                    width_j = stroke_width * (1.0 + 0.06*rng_local.normal(0,1))
-                    opacity_j = 0.92 if k==0 else 0.78
-                    ET.SubElement(parent_group, f"{{{SVG_NS}}}path", {
-                        "d": base_d,
-                        "fill": "none",
-                        "stroke": this_stroke,
-                        "stroke-width": str(width_j),
-                        "stroke-linecap": linecap,
-                        "stroke-linejoin": linejoin,
-                        "opacity": str(opacity_j)
-                    })
+            num_passes = int(2 + (1 if enable_extra_pass else 0))
+            for k in range(num_passes):
+                this_stroke = stroke_color if stroke_color else "#000"
+                width_j = stroke_width * (1.0 + 0.08*rng_local.normal(0,1))
+                opacity_j = 0.92 if k==0 else 0.78
+                dash = random_dasharray(rng_local, base=6.0, jitter=0.4)
+                dup = overlay_clone(child, {
+                    "fill": "none",
+                    "stroke": this_stroke,
+                    "stroke-width": str(width_j),
+                    "stroke-linecap": linecap,
+                    "stroke-linejoin": linejoin,
+                    "stroke-dasharray": dash,
+                    "opacity": str(opacity_j)
+                })
+                dup.set("clip-path", f"url(#{clip_id})")
+                if erode_id:
+                    dup.set("filter", f"url(#{erode_id})")
+                parent_group.append(dup)
 
             # Adjust fill/stroke perceptually (OKLCH), with min ΔE00
             dL, dC, dH = palette_shift
