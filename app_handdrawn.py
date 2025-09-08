@@ -691,8 +691,8 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
                         "fill": "none",
                         "stroke": this_stroke,
                         "stroke-width": str(width_j),
-                    "stroke-linecap": linecap,
-                    "stroke-linejoin": linejoin,
+                        "stroke-linecap": linecap,
+                        "stroke-linejoin": linejoin,
                         "opacity": str(opacity_j)
                     })
 
