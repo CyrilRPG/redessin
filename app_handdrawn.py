@@ -30,7 +30,8 @@ try:
     HAS_CAIROSVG = True
 except Exception:
     HAS_CAIROSVG = False
-from PIL import Image
+from PIL import Image, ImageFilter, ImageOps
+from PIL import ImageChops
 
 SVG_NS = "http://www.w3.org/2000/svg"
 XLINK_NS = "http://www.w3.org/1999/xlink"
@@ -371,6 +372,66 @@ def compute_palette_shift(colors, seed=42, max_dL=0.02, max_dC=0.02, max_dH=3.0)
     dH = float(rng.uniform(-max_dH, max_dH))
     return (dL,dC,dH)
 
+def color_distance_hex(c1, c2):
+    try:
+        return Color(c1).distance(Color(c2), method='2000')
+    except Exception:
+        return 0.0
+
+def apply_shift_with_min_delta(hex_color, dL, dC, dH, min_delta=4.0, strength=1.0):
+    # strength scales the shift; min_delta enforces ΔE00 minimum when possible
+    if not hex_color or hex_color == 'none' or is_black(hex_color):
+        return hex_color
+    scaled = hex_oklch_shift(hex_color, dL=dL*strength, dC=dC*strength, dH=dH*strength)
+    try:
+        delta = color_distance_hex(hex_color, scaled)
+        if delta < min_delta:
+            # amplify towards target while keeping direction
+            factor = (min_delta / max(delta, 1e-6))
+            factor = min(3.0, factor)
+            scaled = hex_oklch_shift(hex_color, dL=dL*strength*factor, dC=dC*strength*factor, dH=dH*strength*factor)
+    except Exception:
+        pass
+    return scaled
+
+# -------- Audit helpers (optional, needs CairoSVG) --------
+def rasterize_svg(svg_bytes, scale=2.0):
+    if not HAS_CAIROSVG:
+        return None
+    try:
+        png = cairosvg.svg2png(bytestring=svg_bytes, scale=scale)
+        img = Image.open(io.BytesIO(png)).convert('L')
+        return img
+    except Exception:
+        return None
+
+def edge_map(img: Image.Image):
+    # Simple edge via Sobel-like filter chain
+    return ImageOps.autocontrast(img.filter(ImageFilter.FIND_EDGES))
+
+def diff_heatmap(orig_svg: bytes, new_svg: bytes, scale=2.0):
+    a = rasterize_svg(orig_svg, scale=scale)
+    b = rasterize_svg(new_svg, scale=scale)
+    if a is None or b is None:
+        return None, {}
+    ea = edge_map(a)
+    eb = edge_map(b)
+    # absolute difference
+    da = ImageChops.difference(ea, eb)
+    # metrics
+    total = np.array(ea).astype(np.float32)
+    diff = np.array(da).astype(np.float32)
+    norm = (diff.sum() / (total.sum() + 1e-6)) if total.sum() > 0 else 0.0
+    stats = {"edge_diff_ratio": float(norm)}
+    # heatmap as red overlay
+    heat = ImageOps.colorize(ImageOps.autocontrast(da), black=(0,0,0), white=(255,0,0)).convert('RGBA')
+    base = a.convert('RGBA')
+    base = ImageOps.colorize(a, black=(0,0,0), white=(255,255,255)).convert('RGBA')
+    blended = Image.alpha_composite(base, heat)
+    buf = io.BytesIO()
+    blended.save(buf, format='PNG')
+    return buf.getvalue(), stats
+
 # ---------------------- SVG processing ----------------------
 def element_to_polyline(el, density):
     tag = el.tag
@@ -438,6 +499,20 @@ def ensure_defs(out):
             return child
     return ET.SubElement(out, f"{{{SVG_NS}}}defs")
 
+def ensure_erode_filter(defs, radius=0.4):
+    fid = f"erode_{str(radius).replace('.', '_')}"
+    # Check existing
+    for f in defs.findall(f".//{{{SVG_NS}}}filter"):
+        if f.get('id') == fid:
+            return fid
+    filt = ET.SubElement(defs, f"{{{SVG_NS}}}filter", {"id": fid, "filterUnits": "objectBoundingBox"})
+    ET.SubElement(filt, f"{{{SVG_NS}}}feMorphology", {
+        "in": "SourceGraphic",
+        "operator": "erode",
+        "radius": str(radius)
+    })
+    return fid
+
 def add_sketch_filter(defs, *, base_freq=0.012, octaves=2, warp_scale=4.0, seed=0, saturation=1.0, contrast=1.0):
     filt = ET.SubElement(defs, f"{{{SVG_NS}}}filter", {"id": "sketch_warp"})
     turb = ET.SubElement(filt, f"{{{SVG_NS}}}feTurbulence", {
@@ -474,7 +549,9 @@ def add_sketch_filter(defs, *, base_freq=0.012, octaves=2, warp_scale=4.0, seed=
 
 def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes=2, stroke_gain=1.1, replace_strokes=True, seed=42,
                roughness=1.2, enable_extra_pass=True, jitter3=0.5, stroke_variation=0.08,
-               color_variation_fill=0.06, color_variation_stroke=0.05):
+               color_variation_fill=0.06, color_variation_stroke=0.05,
+               min_deltaE=6.0, color_strength=1.0,
+               inset_px=0.4):
     # parse root
     try:
         root = ET.fromstring(svg_bytes)
@@ -535,9 +612,9 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
             if is_closed_polyline(pts):
                 # Closed shapes: jittered paths but clipped inside the original outline to preserve silhouette
                 p1, p2 = jitter_pair_polylines(pts, amp=jitter, seed=seed, roughness=roughness, stroke_width=stroke_width, rigor=0.95)
-                if smooth_passes>0:
-                    p1 = chaikin_smooth(p1, passes=smooth_passes)
-                    p2 = chaikin_smooth(p2, passes=smooth_passes)
+            if smooth_passes>0:
+                p1 = chaikin_smooth(p1, passes=smooth_passes)
+                p2 = chaikin_smooth(p2, passes=smooth_passes)
                 paths_ds = [polyline_to_pathd(p1), polyline_to_pathd(p2)]
                 if enable_extra_pass:
                     p3_plus, p3_minus = jitter_pair_polylines(pts, amp=max(0.2, min(jitter3, jitter*0.5)), seed=seed+2, roughness=roughness, stroke_width=stroke_width, rigor=0.98)
@@ -546,26 +623,31 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
                         p3 = chaikin_smooth(p3, passes=smooth_passes)
                     paths_ds.append(polyline_to_pathd(p3))
 
-                # clip path from original polygon
+                # clip path from original polygon, with optional erosion via filter
                 d_clip = polyline_to_pathd(pts + [pts[0]])
                 clip_id = f"clip_safe_{abs(hash(d_clip))%10**8}"
                 cp = ET.SubElement(defs, f"{{{SVG_NS}}}clipPath", {"id": clip_id})
                 ET.SubElement(cp, f"{{{SVG_NS}}}path", {"d": d_clip})
+                # Erode filter id
+                erode_id = ensure_erode_filter(defs, radius=max(0.0, float(inset_px))) if inset_px>0 else None
 
                 for d in paths_ds:
-                    if not d:
-                        continue
+                if not d:
+                    continue
                     this_stroke = stroke_color if stroke_color else "#000"
-                    ET.SubElement(parent_group, f"{{{SVG_NS}}}path", {
-                        "d": d,
-                        "fill": "none",
+                    attribs = {
+                    "d": d,
+                    "fill": "none",
                         "stroke": this_stroke,
                         "stroke-width": str(stroke_width * (1.0 + float(rng_local.normal(0, max(0.0, stroke_variation))))),
                         "stroke-linecap": linecap,
                         "stroke-linejoin": linejoin,
                         "opacity": "0.95",
                         "clip-path": f"url(#{clip_id})"
-                    })
+                    }
+                    if erode_id:
+                        attribs["filter"] = f"url(#{erode_id})"
+                    ET.SubElement(parent_group, f"{{{SVG_NS}}}path", attribs)
             else:
                 # Open polylines/lines: never move geometry. Render multiple passes directly on original segments
                 base_d = polyline_to_pathd(pts)
@@ -578,17 +660,17 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
                         "fill": "none",
                         "stroke": this_stroke,
                         "stroke-width": str(width_j),
-                        "stroke-linecap": linecap,
-                        "stroke-linejoin": linejoin,
+                    "stroke-linecap": linecap,
+                    "stroke-linejoin": linejoin,
                         "opacity": str(opacity_j)
                     })
 
-            # Adjust fill/stroke perceptually (OKLCH), skip black
+            # Adjust fill/stroke perceptually (OKLCH), with min ΔE00
             dL, dC, dH = palette_shift
             if fill_color and fill_color != "none" and not is_black(fill_color):
-                preserved.set("fill", hex_oklch_shift(fill_color, dL=color_variation_fill*dL, dC=color_variation_fill*dC, dH=color_variation_fill*10*dH))
+                preserved.set("fill", apply_shift_with_min_delta(fill_color, dL*color_variation_fill, dC*color_variation_fill, 10*dH*color_variation_fill, min_delta=min_deltaE, strength=color_strength))
             if stroke_color and stroke_color != "none" and not is_black(stroke_color):
-                preserved.set("stroke", hex_oklch_shift(stroke_color, dL=color_variation_stroke*dL, dC=color_variation_stroke*dC, dH=color_variation_stroke*10*dH))
+                preserved.set("stroke", apply_shift_with_min_delta(stroke_color, dL*color_variation_stroke, dC*color_variation_stroke, 10*dH*color_variation_stroke, min_delta=min_deltaE*0.8, strength=color_strength))
 
     process(root, g_main)
     return pretty(out).encode("utf-8")
@@ -621,8 +703,11 @@ with st.expander("Avancé"):
         stroke_variation = st.slider("Variation aléatoire d'épaisseur", 0.0, 0.4, 0.08, 0.02)
         rigor = st.slider("Rigueur anatomique (anti-déformation)", 0.0, 1.0, 0.85, 0.01)
     with cB:
-        color_variation_fill = st.slider("Variation légère du fill", 0.0, 0.2, 0.06, 0.01)
+        color_variation_fill = st.slider("Variation légère du fill", 0.0, 0.2, 0.08, 0.01)
         color_variation_stroke = st.slider("Variation légère du stroke", 0.0, 0.2, 0.05, 0.01)
+        color_strength = st.slider("Intensité du remap couleur", 0.2, 2.0, 1.0, 0.05)
+        min_deltaE = st.slider("ΔE00 minimal (différence visible)", 1.0, 12.0, 6.0, 0.5)
+        inset_px = st.slider("Inset (érosion clip interne, px)", 0.0, 1.5, 0.4, 0.05)
     st.markdown("Mode Anatomie: jitter symétrique conscient de la géométrie; couleurs ajustées en OKLCH.")
 
 if uploaded:
@@ -632,26 +717,38 @@ if uploaded:
         roughness = 1.2; enable_extra_pass = True; jitter3 = 0.5
         stroke_variation = 0.08
         color_variation_fill = 0.06; color_variation_stroke = 0.05
+        color_strength = 1.0; min_deltaE = 6.0; inset_px = 0.4
 
     out = redraw_svg(raw, density=density, jitter=jitter, jitter2=jitter2,
                      smooth_passes=smooth, stroke_gain=stroke_gain,
                      replace_strokes=replace_strokes, seed=int(seed),
                      roughness=roughness, enable_extra_pass=enable_extra_pass, jitter3=jitter3,
                      stroke_variation=stroke_variation,
-                     color_variation_fill=color_variation_fill, color_variation_stroke=color_variation_stroke)
+                     color_variation_fill=color_variation_fill, color_variation_stroke=color_variation_stroke,
+                     min_deltaE=min_deltaE, color_strength=color_strength, inset_px=inset_px)
     st.download_button("⬇️ Télécharger le SVG redessiné", data=out, file_name="redessine.svg", mime="image/svg+xml")
 
     st.subheader("Avant / Après")
     colA, colB = st.columns(2)
     with colA:
         st.caption("Original")
-        st.markdown(f"<div style='border:1px solid #ddd;padding:8px'>{raw.decode('utf-8', errors='ignore')}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='border:1px solid #ddd;padding:8px;max-height:70vh;overflow:auto'>{raw.decode('utf-8', errors='ignore')}</div>", unsafe_allow_html=True)
     with colB:
         st.caption("Redessiné")
-        st.markdown(f"<div style='border:1px solid #ddd;padding:8px'>{out.decode('utf-8')}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='border:1px solid #ddd;padding:8px;max-height:70vh;overflow:auto'>{out.decode('utf-8')}</div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    st.info("Astuce : augmente **Jitter principal** à 3–5 px pour un rendu très marqué. Le remplissage (fill) est conservé tel quel.")
+    st.info("Conseil: augmente ΔE minimal et Intensité pour des couleurs plus différentes; pour non‑déformation stricte hausse l'inset.")
+
+    with st.expander("Mode audit (différence de contours)"):
+        if HAS_CAIROSVG:
+            heat, stats = diff_heatmap(raw, out, scale=2.0)
+            if heat:
+                st.image(heat, caption=f"Heatmap des différences — edge_diff_ratio={stats.get('edge_diff_ratio',0):.4f}")
+            else:
+                st.caption("Rasterisation indisponible.")
+        else:
+            st.caption("Audit désactivé: CairoSVG non installé sur cet environnement.")
 else:
     st.info("Charge un fichier SVG. Le rendu 'main levée' remplace/ajoute les traits en double passe, mais **ne modifie pas** les couleurs ni les surfaces remplies.")
 
