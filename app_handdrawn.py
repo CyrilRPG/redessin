@@ -25,7 +25,11 @@ import re
 import io
 import random
 from coloraide import Color
-import cairosvg
+try:
+    import cairosvg  # optional, may require system cairo
+    HAS_CAIROSVG = True
+except Exception:
+    HAS_CAIROSVG = False
 from PIL import Image
 
 SVG_NS = "http://www.w3.org/2000/svg"
