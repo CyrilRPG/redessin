@@ -612,15 +612,15 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
             if is_closed_polyline(pts):
                 # Closed shapes: jittered paths but clipped inside the original outline to preserve silhouette
                 p1, p2 = jitter_pair_polylines(pts, amp=jitter, seed=seed, roughness=roughness, stroke_width=stroke_width, rigor=0.95)
-            if smooth_passes>0:
-                p1 = chaikin_smooth(p1, passes=smooth_passes)
-                p2 = chaikin_smooth(p2, passes=smooth_passes)
+                if smooth_passes>0:
+                    p1 = chaikin_smooth(p1, passes=int(smooth_passes))
+                    p2 = chaikin_smooth(p2, passes=int(smooth_passes))
                 paths_ds = [polyline_to_pathd(p1), polyline_to_pathd(p2)]
                 if enable_extra_pass:
                     p3_plus, p3_minus = jitter_pair_polylines(pts, amp=max(0.2, min(jitter3, jitter*0.5)), seed=seed+2, roughness=roughness, stroke_width=stroke_width, rigor=0.98)
                     p3 = p3_plus if (seed % 2)==0 else p3_minus
                     if smooth_passes>0:
-                        p3 = chaikin_smooth(p3, passes=smooth_passes)
+                        p3 = chaikin_smooth(p3, passes=int(smooth_passes))
                     paths_ds.append(polyline_to_pathd(p3))
 
                 # clip path from original polygon, with optional erosion via filter
@@ -651,7 +651,7 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
             else:
                 # Open polylines/lines: never move geometry. Render multiple passes directly on original segments
                 base_d = polyline_to_pathd(pts)
-                for k in range(2 + (1 if enable_extra_pass else 0)):
+                for k in range(int(2 + (1 if enable_extra_pass else 0))):
                     this_stroke = stroke_color if stroke_color else "#000"
                     width_j = stroke_width * (1.0 + 0.06*rng_local.normal(0,1))
                     opacity_j = 0.92 if k==0 else 0.78
