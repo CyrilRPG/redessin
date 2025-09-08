@@ -530,37 +530,58 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
             linecap = child.get("stroke-linecap","round")
             linejoin = child.get("stroke-linejoin","round")
 
-            # Build symmetric jittered polylines for geometry preservation
-            p1, p2 = jitter_pair_polylines(pts, amp=jitter, seed=seed, roughness=roughness, stroke_width=stroke_width, rigor=0.85)
-            if smooth_passes>0:
-                p1 = chaikin_smooth(p1, passes=smooth_passes)
-                p2 = chaikin_smooth(p2, passes=smooth_passes)
-
-            d1 = polyline_to_pathd(p1); d2 = polyline_to_pathd(p2)
-            paths_ds = [d1, d2]
-            if enable_extra_pass:
-                p3_plus, p3_minus = jitter_pair_polylines(pts, amp=max(0.25, min(jitter3, jitter*0.5)), seed=seed+2, roughness=roughness, stroke_width=stroke_width, rigor=0.9)
-                p3 = p3_plus if (seed % 2)==0 else p3_minus
-                if smooth_passes>0:
-                    p3 = chaikin_smooth(p3, passes=smooth_passes)
-                d3 = polyline_to_pathd(p3)
-                paths_ds.append(d3)
-
+            # Zero-deformation strategy
             rng_local = np.random.default_rng(seed)
-            for d in paths_ds:
-                if not d:
-                    continue
-                this_stroke = stroke_color if stroke_color else "#000"
-                # Random hue jitter removed; color changes handled below deterministically
-                path = ET.SubElement(parent_group, f"{{{SVG_NS}}}path", {
-                    "d": d,
-                    "fill": "none",
-                    "stroke": this_stroke,
-                    "stroke-width": str(stroke_width * (1.0 + float(rng_local.normal(0, max(0.0, stroke_variation))))),
-                    "stroke-linecap": linecap,
-                    "stroke-linejoin": linejoin,
-                    "opacity": "0.95"
-                })
+            if is_closed_polyline(pts):
+                # Closed shapes: jittered paths but clipped inside the original outline to preserve silhouette
+                p1, p2 = jitter_pair_polylines(pts, amp=jitter, seed=seed, roughness=roughness, stroke_width=stroke_width, rigor=0.95)
+                if smooth_passes>0:
+                    p1 = chaikin_smooth(p1, passes=smooth_passes)
+                    p2 = chaikin_smooth(p2, passes=smooth_passes)
+                paths_ds = [polyline_to_pathd(p1), polyline_to_pathd(p2)]
+                if enable_extra_pass:
+                    p3_plus, p3_minus = jitter_pair_polylines(pts, amp=max(0.2, min(jitter3, jitter*0.5)), seed=seed+2, roughness=roughness, stroke_width=stroke_width, rigor=0.98)
+                    p3 = p3_plus if (seed % 2)==0 else p3_minus
+                    if smooth_passes>0:
+                        p3 = chaikin_smooth(p3, passes=smooth_passes)
+                    paths_ds.append(polyline_to_pathd(p3))
+
+                # clip path from original polygon
+                d_clip = polyline_to_pathd(pts + [pts[0]])
+                clip_id = f"clip_safe_{abs(hash(d_clip))%10**8}"
+                cp = ET.SubElement(defs, f"{{{SVG_NS}}}clipPath", {"id": clip_id})
+                ET.SubElement(cp, f"{{{SVG_NS}}}path", {"d": d_clip})
+
+                for d in paths_ds:
+                    if not d:
+                        continue
+                    this_stroke = stroke_color if stroke_color else "#000"
+                    ET.SubElement(parent_group, f"{{{SVG_NS}}}path", {
+                        "d": d,
+                        "fill": "none",
+                        "stroke": this_stroke,
+                        "stroke-width": str(stroke_width * (1.0 + float(rng_local.normal(0, max(0.0, stroke_variation))))),
+                        "stroke-linecap": linecap,
+                        "stroke-linejoin": linejoin,
+                        "opacity": "0.95",
+                        "clip-path": f"url(#{clip_id})"
+                    })
+            else:
+                # Open polylines/lines: never move geometry. Render multiple passes directly on original segments
+                base_d = polyline_to_pathd(pts)
+                for k in range(2 + (1 if enable_extra_pass else 0)):
+                    this_stroke = stroke_color if stroke_color else "#000"
+                    width_j = stroke_width * (1.0 + 0.06*rng_local.normal(0,1))
+                    opacity_j = 0.92 if k==0 else 0.78
+                    ET.SubElement(parent_group, f"{{{SVG_NS}}}path", {
+                        "d": base_d,
+                        "fill": "none",
+                        "stroke": this_stroke,
+                        "stroke-width": str(width_j),
+                        "stroke-linecap": linecap,
+                        "stroke-linejoin": linejoin,
+                        "opacity": str(opacity_j)
+                    })
 
             # Adjust fill/stroke perceptually (OKLCH), skip black
             dL, dC, dH = palette_shift
