@@ -24,6 +24,9 @@ from svgpathtools import parse_path, Path as SvgPath
 import re
 import io
 import random
+from coloraide import Color
+import cairosvg
+from PIL import Image
 
 SVG_NS = "http://www.w3.org/2000/svg"
 XLINK_NS = "http://www.w3.org/1999/xlink"
@@ -330,6 +333,40 @@ def adjust_hex_lightness(color, factor=1.0):
     r = clamp(r*factor); g = clamp(g*factor); b = clamp(b*factor)
     return rgb_to_hex((r,g,b))
 
+# -------- Perceptual color helpers (OKLCH) --------
+def hex_oklch_shift(color, dL=0.0, dC=0.0, dH=0.0):
+    try:
+        col = Color(color)
+        oklch = col.convert('oklch')
+        L, C, H = oklch['l'], oklch['c'], oklch['h']
+        L = max(0.0, min(1.0, L + dL))
+        C = max(0.0, C + dC)
+        H = (H + dH) % 360.0
+        shifted = Color('oklch', [L, C, H]).convert('srgb')
+        # clamp and output hex
+        r = clamp(round(shifted['r']*255)); g = clamp(round(shifted['g']*255)); b = clamp(round(shifted['b']*255))
+        return rgb_to_hex((r,g,b))
+    except Exception:
+        return color
+
+def collect_svg_colors(root):
+    colors = []
+    for el in root.iter():
+        for attr in ('fill','stroke'):
+            v = el.get(attr)
+            if v and v != 'none' and v.startswith('#'):
+                colors.append(v)
+    return colors
+
+def compute_palette_shift(colors, seed=42, max_dL=0.02, max_dC=0.02, max_dH=3.0):
+    if not colors:
+        return (0.0,0.0,0.0)
+    rng = np.random.default_rng(seed)
+    dL = float(rng.uniform(-max_dL, max_dL))
+    dC = float(rng.uniform(-max_dC, max_dC))
+    dH = float(rng.uniform(-max_dH, max_dH))
+    return (dL,dC,dH)
+
 # ---------------------- SVG processing ----------------------
 def element_to_polyline(el, density):
     tag = el.tag
@@ -445,6 +482,8 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
         else:
             raise
 
+    # Global palette shift (perceptual) for harmony
+    palette_shift = compute_palette_shift(collect_svg_colors(root), seed=seed)
     # Keep viewBox/size
     out = ET.Element(root.tag, root.attrib)
     defs = ensure_defs(out)
@@ -519,20 +558,19 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
                     "opacity": "0.95"
                 })
 
-            # Adjust fill/stroke colors slightly (not for black)
+            # Adjust fill/stroke perceptually (OKLCH), skip black
+            dL, dC, dH = palette_shift
             if fill_color and fill_color != "none" and not is_black(fill_color):
-                factor = 1.0 + color_variation_fill * (1 if (seed % 2)==0 else -1)
-                preserved.set("fill", adjust_hex_lightness(fill_color, factor))
+                preserved.set("fill", hex_oklch_shift(fill_color, dL=color_variation_fill*dL, dC=color_variation_fill*dC, dH=color_variation_fill*10*dH))
             if stroke_color and stroke_color != "none" and not is_black(stroke_color):
-                factor_s = 1.0 + color_variation_stroke * (1 if (seed % 3)==0 else -1)
-                preserved.set("stroke", adjust_hex_lightness(stroke_color, factor_s))
+                preserved.set("stroke", hex_oklch_shift(stroke_color, dL=color_variation_stroke*dL, dC=color_variation_stroke*dC, dH=color_variation_stroke*10*dH))
 
     process(root, g_main)
     return pretty(out).encode("utf-8")
 
 # ---------------------- Streamlit UI ----------------------
 st.set_page_config(page_title="Redessiner SVG — style main levée", page_icon="✏️", layout="wide")
-st.title("✏️ Redessiner un SVG en **style dessiné à la main** (couleurs intactes, anatomie préservée)")
+st.title("✏️ Redessiner un SVG — Mode Anatomie (géométrie préservée)")
 
 uploaded = st.file_uploader("Dépose un SVG", type=["svg"])
 
@@ -560,7 +598,7 @@ with st.expander("Avancé"):
     with cB:
         color_variation_fill = st.slider("Variation légère du fill", 0.0, 0.2, 0.06, 0.01)
         color_variation_stroke = st.slider("Variation légère du stroke", 0.0, 0.2, 0.05, 0.01)
-    st.markdown("Mode Anatomie: aucun warp/overshoot; jitter symétrique borné pour préserver la géométrie.")
+    st.markdown("Mode Anatomie: jitter symétrique conscient de la géométrie; couleurs ajustées en OKLCH.")
 
 if uploaded:
     raw = uploaded.read()
