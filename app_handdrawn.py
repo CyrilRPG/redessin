@@ -1,570 +1,432 @@
-"""
-Streamlit — Redessiner un SVG en style 'dessiné à la main' (anatomie préservée)
--------------------------------------------------------------------------------
-Déploiement Streamlit Community Cloud :
-- Dépose ce repo avec `app_handdrawn.py` comme entrée principale (renomme en `app.py` si tu veux).
-- `requirements.txt` inclus.
+# app.py
+# ------------------------------------------------------------
+# Streamlit — Redessiner un SVG (effet "dessiné à la main")
+# SANS déformer la géométrie (anatomie préservée)
+#
+# - Conserve strictement les coordonnées des chemins (aucun jitter / warp)
+# - Décale légèrement les couleurs (HSL) pour réduire la ressemblance
+# - Redessine les traits : 2–3 passes en pointillés arrondis
+# - Variation subtile d'épaisseur / opacité + "grain" doux (aucun déplacement)
+# - Option : hachures internes via clipPath (bordures intactes)
+#
+# Déploiement Streamlit Cloud :
+# 1) requirements.txt : streamlit>=1.28
+# 2) streamlit run app.py (ou via share.streamlit.io)
+# ------------------------------------------------------------
 
-
-PRINCIPE
-- **Couleurs et remplissages conservés** (on garde l'élément source pour le fill).
-- **Traits redessinés**: on reconstruit des contours "jittered" en 2 passes (façon Rough.js).
-- Trajet de jitter le long des **normales** pour éviter les glissements tangents.
-- **Lissage Chaikin** pour un rendu crayon/feutre, et cap/join arrondis.
-
-NB : On évite toute modification destructive des surfaces remplies (fill), afin d'éliminer les risques
-d'erreur anatomique. Les traits sont clairement différents de l'original (visuellement 'main levée').
-"""
 import streamlit as st
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
-import numpy as np
-from math import cos, sin, pi
-from svgpathtools import parse_path, Path as SvgPath
 import re
-import io
 import random
 
 SVG_NS = "http://www.w3.org/2000/svg"
-XLINK_NS = "http://www.w3.org/1999/xlink"
 ET.register_namespace("", SVG_NS)
-ET.register_namespace("xlink", XLINK_NS)
 
-# ---------------------- Geometry helpers ----------------------
+# --------------------- Utils: parsing & styles ---------------------
+
 def pretty(elem):
+    """Beautify XML output."""
     return minidom.parseString(ET.tostring(elem, encoding="utf-8")).toprettyxml(indent="  ")
 
-def get_float(el, name, default=0.0):
-    v = el.get(name)
-    if v is None:
-        return default
-    try:
-        return float(v)
-    except:
-        # remove units if any
-        return float(re.sub(r"[^0-9.+-eE]", "", v))
-
-def parse_points(points_str):
-    # supports "x1,y1 x2,y2 ..." or "x1 y1 x2 y2"
-    pts = []
-    if not points_str:
-        return pts
-    # Replace commas with spaces, then split
-    s = re.sub(r"[,\s]+", " ", points_str.strip()).split()
-    for i in range(0, len(s), 2):
-        try:
-            x = float(s[i]); y = float(s[i+1])
-            pts.append((x, y))
-        except:
-            break
-    return pts
-
-def sample_svgpath_to_polyline(d, density=1.5):
-    """Sample a path 'd' into polyline points.
-    density: points per 100px of length (>= 0.5)"""
-    try:
-        p = parse_path(d)
-    except Exception:
-        return []
-    L = p.length()
-    if L == 0:
-        return []
-    n = max(int((L/100.0) * max(0.5, density)), 8)
-    # Use arclength parameterization for uniform sampling
-    pts = []
-    for i in range(n+1):
-        s = (L * i) / n
-        t = p.ilength(s)
-        z = p.point(t)
-        pts.append((z.real, z.imag))
-    return pts
-
-def circle_points(cx, cy, r, n=120):
-    return [(cx + r*cos(2*pi*i/n), cy + r*sin(2*pi*i/n)) for i in range(n+1)]
-
-def ellipse_points(cx, cy, rx, ry, n=160):
-    return [(cx + rx*cos(2*pi*i/n), cy + ry*sin(2*pi*i/n)) for i in range(n+1)]
-
-def rect_points(x, y, w, h, rx=0.0, ry=0.0, n_arc=24):
-    # rounded rectangle approx
-    if rx==0 and ry==0:
-        return [(x,y),(x+w,y),(x+w,y+h),(x,y+h),(x,y)]
-    rx = min(rx, w/2); ry = min(ry, h/2)
-    pts = []
-    def arc(cx, cy, rx, ry, start, end, steps):
-        return [(cx + rx*cos(t), cy + ry*sin(t)) for t in np.linspace(start, end, steps)]
-    # start at (x+rx, y)
-    pts += [(x+rx, y)]
-    # top edge to (x+w-rx, y)
-    pts += [(x+w-rx, y)]
-    # top-right arc
-    pts += arc(x+w-rx, y+ry, rx, ry, -pi/2, 0, n_arc)
-    # right edge
-    pts += [(x+w, y+h-ry)]
-    # bottom-right arc
-    pts += arc(x+w-rx, y+h-ry, rx, ry, 0, pi/2, n_arc)
-    # bottom edge
-    pts += [(x+rx, y+h)]
-    # bottom-left arc
-    pts += arc(x+rx, y+h-ry, rx, ry, pi/2, pi, n_arc)
-    # left edge
-    pts += [(x, y+ry)]
-    # top-left arc
-    pts += arc(x+rx, y+ry, rx, ry, pi, 3*pi/2, n_arc)
-    pts += [(x+rx, y)]
-    return pts
-
-def normals(points):
-    """Compute unit normals for each segment, then per point (averaged)."""
-    if len(points) < 2:
-        return [(0.0,0.0)]*len(points)
-    seg_normals = []
-    for i in range(len(points)-1):
-        x1,y1 = points[i]; x2,y2 = points[i+1]
-        dx, dy = x2-x1, y2-y1
-        l = (dx*dx+dy*dy)**0.5 or 1.0
-        nx, ny = -dy/l, dx/l
-        seg_normals.append((nx, ny))
-    # per-point average of adjacent segment normals
-    pt_normals = [(seg_normals[0][0], seg_normals[0][1])]
-    for i in range(1, len(points)-1):
-        nx = seg_normals[i-1][0] + seg_normals[i][0]
-        ny = seg_normals[i-1][1] + seg_normals[i][1]
-        l = (nx*nx+ny*ny)**0.5 or 1.0
-        pt_normals.append((nx/l, ny/l))
-    pt_normals.append((seg_normals[-1][0], seg_normals[-1][1]))
-    return pt_normals
-
-def chaikin_smooth(points, passes=1):
-    pts = points[:]
-    for _ in range(max(0, passes)):
-        new_pts = [pts[0]]
-        for i in range(len(pts)-1):
-            p = np.array(pts[i]); q = np.array(pts[i+1])
-            Q = 0.75*p + 0.25*q
-            R = 0.25*p + 0.75*q
-            new_pts.extend([tuple(Q), tuple(R)])
-        new_pts.append(pts[-1])
-        pts = new_pts
-    return pts
-
-def jitter_polyline(points, amp=1.5, seed=42, roughness=1.0):
-    """Apply normal-direction jitter using smoothed random noise."""
-    if len(points) < 3:
-        return points
-    rng = np.random.default_rng(seed)
-    N = len(points)
-    # random walk smoothed
-    base = rng.normal(0, 1, N)
-    # smooth via convolution to avoid high-frequency zigzags
-    k = int(max(3, 7*roughness))
-    kernel = np.hanning(k); kernel /= kernel.sum()
-    smooth = np.convolve(base, kernel, mode="same")
-    smooth /= (np.std(smooth) + 1e-6)
-    norms = normals(points)
-    out = []
-    for (x,y), (nx,ny), s in zip(points, norms, smooth):
-        d = amp * s
-        out.append((x + d*nx, y + d*ny))
+def parse_style_attr(style_str):
+    """Parse inline style='a:b;c:d' -> dict."""
+    out = {}
+    if not style_str:
+        return out
+    for part in style_str.split(";"):
+        if ":" in part:
+            k, v = part.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            if k:
+                out[k] = v
     return out
 
-def polyline_to_pathd(points):
-    if not points:
-        return ""
-    d = ["M {:.3f} {:.3f}".format(points[0][0], points[0][1])]
-    for (x,y) in points[1:]:
-        d.append("L {:.3f} {:.3f}".format(x, y))
-    return " ".join(d)
+def merge_inline_styles(el):
+    """
+    Return a dict of 'computed' attributes for fill/stroke/stroke-width/opacity/etc.
+    Priority: explicit attributes > inline style.
+    """
+    computed = dict(el.attrib)  # copy
+    styles = parse_style_attr(el.get("style", ""))
 
-def darken_hex(color, factor=0.85):
-    # naive darken for hex like #RRGGBB
-    if not color or not color.startswith("#") or len(color) not in (4,7):
-        return color
-    if len(color)==4:
-        r = int(color[1]*2,16); g=int(color[2]*2,16); b=int(color[3]*2,16)
-    else:
-        r = int(color[1:3],16); g=int(color[3:5],16); b=int(color[5:7],16)
-    r = int(max(0, min(255, r*factor)))
-    g = int(max(0, min(255, g*factor)))
-    b = int(max(0, min(255, b*factor)))
-    return "#{:02x}{:02x}{:02x}".format(r,g,b)
+    # Map common CSS style keys to attributes if not already present
+    mapping = {
+        "fill": "fill",
+        "stroke": "stroke",
+        "stroke-width": "stroke-width",
+        "stroke-linecap": "stroke-linecap",
+        "stroke-linejoin": "stroke-linejoin",
+        "opacity": "opacity",
+        "fill-opacity": "fill-opacity",
+        "stroke-opacity": "stroke-opacity",
+    }
+    for sk, ak in mapping.items():
+        if ak not in computed and sk in styles:
+            computed[ak] = styles[sk]
 
-def clamp(v, lo=0, hi=255):
-    return max(lo, min(hi, int(v)))
+    return computed
 
-def hex_to_rgb(color):
-    if not color or not color.startswith("#"):
+def duplicate_with_computed(el):
+    """Duplicate element and 'normalize' inline styles into attributes on the copy."""
+    comp = merge_inline_styles(el)
+    dup = ET.Element(el.tag, comp)
+    return dup
+
+# --------------------- Color conversions (HSL) ---------------------
+
+def clamp01(x):
+    return max(0.0, min(1.0, x))
+
+def parse_color(cstr):
+    """Return (r,g,b,a) or None if unsupported (named colors left unchanged)."""
+    if not cstr or cstr in ("none", "transparent"):
         return None
-    if len(color) == 4:
-        r = int(color[1]*2,16); g=int(color[2]*2,16); b=int(color[3]*2,16)
-    elif len(color) == 7:
-        r = int(color[1:3],16); g=int(color[3:5],16); b=int(color[5:7],16)
+    cstr = cstr.strip()
+    if cstr.startswith("#"):
+        # #rgb or #rrggbb
+        if len(cstr) == 4:
+            r = int(cstr[1]*2, 16); g = int(cstr[2]*2, 16); b = int(cstr[3]*2, 16)
+            return (r, g, b, 1.0)
+        if len(cstr) == 7:
+            r = int(cstr[1:3], 16); g = int(cstr[3:5], 16); b = int(cstr[5:7], 16)
+            return (r, g, b, 1.0)
+    m = re.match(r"rgba?\(([^)]+)\)", cstr, re.I)
+    if m:
+        parts = [p.strip() for p in m.group(1).split(",")]
+        if len(parts) >= 3:
+            r = int(float(parts[0])); g = int(float(parts[1])); b = int(float(parts[2]))
+            a = float(parts[3]) if len(parts) == 4 else 1.0
+            return (r, g, b, a)
+    return None  # named color -> unchanged
+
+def css_rgba(rgba):
+    r, g, b, a = rgba
+    if a >= 0.999:
+        return f"rgb({r},{g},{b})"
+    return f"rgba({r},{g},{b},{a:.3f})"
+
+def rgb_to_hsl(r, g, b):
+    r /= 255.0; g /= 255.0; b /= 255.0
+    mx = max(r, g, b); mn = min(r, g, b)
+    l = (mx + mn) / 2.0
+    if mx == mn:
+        return (0.0, 0.0, l)
+    d = mx - mn
+    s = d / (2.0 - mx - mn) if l > 0.5 else d / (mx + mn)
+    if mx == r:
+        h = (g - b) / d + (6 if g < b else 0)
+    elif mx == g:
+        h = (b - r) / d + 2
     else:
-        return None
-    return (r,g,b)
+        h = (r - g) / d + 4
+    h /= 6.0
+    return (h * 360.0, s, l)
 
-def rgb_to_hex(rgb):
-    r,g,b = rgb
-    return "#{:02x}{:02x}{:02x}".format(clamp(r), clamp(g), clamp(b))
+def hsl_to_rgb(h, s, l):
+    h = (h % 360.0) / 360.0
 
-def jitter_hex_color(color, amount=10, rng=None):
-    rgb = hex_to_rgb(color)
-    if rgb is None:
-        return color
-    if rng is None:
-        rng = np.random.default_rng()
-    dr = rng.integers(-amount, amount+1)
-    dg = rng.integers(-amount, amount+1)
-    db = rng.integers(-amount, amount+1)
-    r,g,b = rgb
-    return rgb_to_hex((r+dr, g+dg, b+db))
+    def f(p, q, t):
+        if t < 0: t += 1
+        if t > 1: t -= 1
+        if t < 1/6: return p + (q - p) * 6 * t
+        if t < 1/2: return q
+        if t < 2/3: return p + (q - p) * (2/3 - t) * 6
+        return p
 
-def is_black(color, threshold=10):
-    rgb = hex_to_rgb(color)
-    if rgb is None:
-        return False
-    return rgb[0] < threshold and rgb[1] < threshold and rgb[2] < threshold
-
-def adjust_hex_lightness(color, factor=1.0):
-    rgb = hex_to_rgb(color)
-    if rgb is None:
-        return color
-    r,g,b = rgb
-    r = clamp(r*factor); g = clamp(g*factor); b = clamp(b*factor)
-    return rgb_to_hex((r,g,b))
-
-# ---------------------- SVG processing ----------------------
-def element_to_polyline(el, density):
-    tag = el.tag
-    if tag.endswith("path"):
-        d = el.get("d", "")
-        return sample_svgpath_to_polyline(d, density=density)
-    elif tag.endswith("polyline") or tag.endswith("polygon"):
-        pts = parse_points(el.get("points", ""))
-        if tag.endswith("polygon") and pts:
-            pts = pts + [pts[0]]
-        return pts
-    elif tag.endswith("line"):
-        x1 = get_float(el, "x1"); y1 = get_float(el, "y1")
-        x2 = get_float(el, "x2"); y2 = get_float(el, "y2")
-        return [(x1,y1),(x2,y2)]
-    elif tag.endswith("rect"):
-        x = get_float(el,"x"); y=get_float(el,"y")
-        w = get_float(el,"width"); h=get_float(el,"height")
-        rx = get_float(el,"rx",0.0); ry=get_float(el,"ry",0.0)
-        return rect_points(x,y,w,h,rx,ry)
-    elif tag.endswith("circle"):
-        cx = get_float(el,"cx"); cy=get_float(el,"cy"); r=get_float(el,"r")
-        return circle_points(cx,cy,r)
-    elif tag.endswith("ellipse"):
-        cx = get_float(el,"cx"); cy=get_float(el,"cy"); rx=get_float(el,"rx"); ry=get_float(el,"ry")
-        return ellipse_points(cx,cy,rx,ry)
+    if s == 0:
+        r = g = b = l
     else:
-        return []
+        q = l + s - l * s if l < 0.5 else l + s - l * s
+        p = 2 * l - q
+        r = f(p, q, h + 1/3)
+        g = f(p, q, h)
+        b = f(p, q, h - 1/3)
 
-def clone_without_stroke(el):
-    c = ET.Element(el.tag, el.attrib)
-    # remove stroke to avoid double edges
-    if "stroke" in c.attrib:
-        c.set("data-original-stroke", c.get("stroke"))
-        c.set("stroke", "none")
-    return c
+    return (int(round(r * 255)), int(round(g * 255)), int(round(b * 255)))
 
-def is_closed_polyline(points, eps=1e-3):
-    if not points:
-        return False
-    x1,y1 = points[0]
-    x2,y2 = points[-1]
-    return ((x1-x2)**2 + (y1-y2)**2) ** 0.5 < eps
+def shift_color(cstr, dh=8.0, ds=0.05, dl=0.02):
+    """Shift color in HSL; leave unsupported/named colors unchanged."""
+    rgba = parse_color(cstr)
+    if not rgba:
+        return cstr
+    r, g, b, a = rgba
+    h, s, l = rgb_to_hsl(r, g, b)
+    h = (h + dh) % 360.0
+    s = clamp01(s * (1.0 + ds))
+    l = clamp01(l * (1.0 + dl))
+    r2, g2, b2 = hsl_to_rgb(h, s, l)
+    return css_rgba((r2, g2, b2, a))
 
-def overshoot_polyline(points, amount=4.0):
-    # Extend first and last segments a little to emulate pen overshoot for open paths
-    if len(points) < 2 or is_closed_polyline(points):
-        return points
-    p0 = np.array(points[0]); p1 = np.array(points[1])
-    pn1 = np.array(points[-2]); pn = np.array(points[-1])
-    v_start = p0 - p1
-    v_end = pn - pn1
-    def extend(p, v, amt):
-        l = np.linalg.norm(v) or 1.0
-        d = (v / l) * amt
-        return tuple((p + d).tolist())
-    new_start = extend(p0, v_start, amount)
-    new_end = extend(pn, v_end, amount)
-    return [new_start] + points + [new_end]
+# --------------------- Filters & effects ---------------------
 
-def ensure_defs(out):
-    # Find or create defs
-    for child in list(out):
-        if child.tag.endswith("defs"):
-            return child
-    return ET.SubElement(out, f"{{{SVG_NS}}}defs")
+def ensure_defs(root):
+    for c in list(root):
+        if c.tag.endswith("defs"):
+            return c
+    return ET.SubElement(root, f"{{{SVG_NS}}}defs")
 
-def add_sketch_filter(defs, *, base_freq=0.012, octaves=2, warp_scale=4.0, seed=0, saturation=1.0, contrast=1.0):
-    filt = ET.SubElement(defs, f"{{{SVG_NS}}}filter", {"id": "sketch_warp"})
-    turb = ET.SubElement(filt, f"{{{SVG_NS}}}feTurbulence", {
-        "type": "fractalNoise",
-        "baseFrequency": str(base_freq),
-        "numOctaves": str(int(max(1, octaves))),
-        "seed": str(int(seed)),
-        "result": "noise"
+def add_grain_filter(defs, fid="grain", freq=0.8, seed=1, intensity=0.07):
+    """
+    'Grain' doux : pas de feDisplacementMap (donc aucun déplacement).
+    On module légèrement l'alpha visuelle pour un rendu papier.
+    """
+    f = ET.SubElement(defs, f"{{{SVG_NS}}}filter", {
+        "id": fid, "x": "-3%", "y": "-3%", "width": "106%", "height": "106%",
+        "color-interpolation-filters": "sRGB"
     })
-    disp = ET.SubElement(filt, f"{{{SVG_NS}}}feDisplacementMap", {
-        "in": "SourceGraphic",
-        "in2": "noise",
-        "scale": str(float(warp_scale)),
-        "xChannelSelector": "R",
-        "yChannelSelector": "G",
-        "result": "displaced"
+    ET.SubElement(f, f"{{{SVG_NS}}}feTurbulence", {
+        "type": "fractalNoise", "baseFrequency": str(freq),
+        "numOctaves": "2", "seed": str(seed), "result": "n"
     })
-    if saturation != 1.0 or contrast != 1.0:
-        # Optional tone tweak (subtle)
-        ET.SubElement(filt, f"{{{SVG_NS}}}feComponentTransfer", {
-            "in": "displaced",
-            "result": "toned"
+    ET.SubElement(f, f"{{{SVG_NS}}}feColorMatrix", {
+        "in": "n", "type": "saturate", "values": "0", "result": "n2"
+    })
+    ET.SubElement(f, f"{{{SVG_NS}}}feComposite", {
+        "in": "SourceGraphic", "in2": "n2", "operator": "arithmetic",
+        "k1": "0", "k2": "1", "k3": f"{float(intensity):.3f}", "k4": "0"
+    })
+    return f
+
+def make_sketch_strokes(base_el, passes=2, width=1.2, seed=42, stroke_color=None):
+    """
+    Crée 'passes' duplicates du même élément avec :
+    - fill none
+    - stroke dasharray aléatoire
+    - caps/joins arrondis
+    - légère variation d'épaisseur/opacity
+    - filtre grain (pas de déplacement)
+    """
+    rnd = random.Random(seed)
+    overlays = []
+    for _ in range(passes):
+        d = duplicate_with_computed(base_el)
+        d.set("fill", "none")
+        if stroke_color:
+            d.set("stroke", stroke_color)
+        # width variation
+        w = width * (0.92 + 0.16 * rnd.random())
+        d.set("stroke-width", f"{w:.3f}")
+        d.set("stroke-linecap", d.get("stroke-linecap", "round"))
+        d.set("stroke-linejoin", d.get("stroke-linejoin", "round"))
+        # dash pattern
+        base = 6.0 * (0.9 + 0.2 * rnd.random())
+        segs = [max(1.0, base * (0.6 + 0.8 * rnd.random())) for _ in range(10)]
+        d.set("stroke-dasharray", " ".join(f"{s:.2f}" for s in segs))
+        d.set("stroke-dashoffset", f"{base * rnd.random():.2f}")
+        d.set("opacity", f"{0.78 + 0.18 * rnd.random():.3f}")
+        d.set("filter", "url(#grain)")
+        overlays.append(d)
+    return overlays
+
+# --------------------- Hatching (optionnel) ---------------------
+
+SAFE_SHAPES_FOR_HATCH = {"path", "polygon", "rect", "circle", "ellipse"}
+
+def add_hatching(defs, parent_group, el, spacing=8.0, angle=45.0, opacity=0.18):
+    """
+    Hachures internes : on clippe un groupe de lignes à la forme.
+    Note : si l'élément a des 'transform' complexes, l'alignement peut varier.
+    """
+    tag_local = el.tag.split("}")[-1]
+    if tag_local not in SAFE_SHAPES_FOR_HATCH:
+        return
+    # Créer clipPath unique
+    clip_id = f"hclip_{id(el)}"
+    cp = ET.SubElement(defs, f"{{{SVG_NS}}}clipPath", {"id": clip_id})
+    cp.append(duplicate_with_computed(el))
+    # Groupe hachures
+    g = ET.SubElement(parent_group, f"{{{SVG_NS}}}g", {
+        "clip-path": f"url(#{clip_id})",
+        "opacity": str(opacity),
+        "transform": f"rotate({angle})"
+    })
+    # Lignes infinies (grosses marges), on compte sur le clip
+    x = -5000.0
+    while x <= 5000.0:
+        line = ET.SubElement(g, f"{{{SVG_NS}}}line", {
+            "x1": str(x), "y1": "-5000", "x2": str(x), "y2": "5000",
+            "stroke": el.get("fill", "#000"),
+            "stroke-width": "1.0",
+            "stroke-linecap": "round"
         })
-        # We won't parameterize per-channel here; browser defaults keep it subtle
-        final_in = "toned"
-    else:
-        final_in = "displaced"
-    ET.SubElement(filt, f"{{{SVG_NS}}}feComposite", {
-        "in": final_in,
-        "in2": "SourceGraphic",
-        "operator": "over"
-    })
-    return filt
+        x += float(spacing)
 
-def redraw_svg(svg_bytes, *, density=1.8, jitter=2.4, jitter2=1.2, smooth_passes=1, stroke_gain=1.15, replace_strokes=True, seed=42,
-               roughness=1.0, enable_extra_pass=True, jitter3=0.8, color_jitter=8, overshoot_amt=3.0,
-               enable_warp=True, warp_scale=3.0, warp_freq=0.01, warp_octaves=2,
-               stroke_variation=0.1,
-               enable_hatching=False, hatch_spacing=8.0, hatch_angle=45.0, hatch_jitter=1.5, hatch_opacity=0.22,
-               anatomy_mode=True, color_variation_fill=0.08, color_variation_stroke=0.06):
-    # parse root
+# --------------------- Core processing ---------------------
+
+SAFE_LEAF = {"path", "line", "polyline", "polygon", "rect", "circle", "ellipse", "text"}
+
+def process_svg(svg_bytes,
+                hue_shift=8.0, sat_gain=0.05, light_gain=0.02,
+                passes=2, stroke_gain=1.2,
+                replace_original_strokes=True,
+                seed=42,
+                enable_hatching=False, hatch_spacing=8.0, hatch_angle=45.0, hatch_opacity=0.18,
+                grain_freq=0.8, grain_intensity=0.07):
+    """
+    - Ne modifie pas la géométrie
+    - Recolore légèrement (HSL)
+    - Redessine traits en passes pointillées
+    """
+    # Parse
     try:
         root = ET.fromstring(svg_bytes)
     except ET.ParseError:
-        text = svg_bytes.decode("utf-8", errors="ignore")
-        start = text.find("<svg")
-        if start!=-1:
-            root = ET.fromstring(text[start:].encode("utf-8"))
+        txt = svg_bytes.decode("utf-8", errors="ignore")
+        start = txt.find("<svg")
+        if start != -1:
+            root = ET.fromstring(txt[start:].encode("utf-8"))
         else:
             raise
 
-    # Keep viewBox/size
+    # Nouveau root avec mêmes attributs (viewBox/width/height)
     out = ET.Element(root.tag, root.attrib)
     defs = ensure_defs(out)
-    # Optionally add warp filter
-    if enable_warp and not anatomy_mode and float(warp_scale) > 0:
-        add_sketch_filter(defs, base_freq=warp_freq, octaves=warp_octaves, warp_scale=warp_scale, seed=seed)
-    g_main = ET.SubElement(out, f"{{{SVG_NS}}}g", {"id":"handdrawn"})
-    if enable_warp and not anatomy_mode and float(warp_scale) > 0:
-        g_main.set("filter", "url(#sketch_warp)")
+    add_grain_filter(defs, seed=int(seed), freq=float(grain_freq), intensity=float(grain_intensity))
+    wrapper = ET.SubElement(out, f"{{{SVG_NS}}}g", {"id": "handdrawn"})
 
-    # simple counter for unique ids
-    unique_counter = [0]
+    def walk(node, parent):
+        for child in list(node):
+            local = child.tag.split("}")[-1]
 
-    # Helpers for hatching
-    def add_hatching_for_points(parent_group, pts, color, spacing, angle_deg, jitter_amt, opacity, seed_local):
-        if not pts or is_closed_polyline(pts) is False:
-            return
-        xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
-        cx = (minx+maxx)/2.0; cy=(miny+maxy)/2.0
-        # clip path using polygonal approximation
-        unique_counter[0] += 1
-        clip_id = f"clip_hatch_{unique_counter[0]}"
-        cp = ET.SubElement(defs, f"{{{SVG_NS}}}clipPath", {"id": clip_id})
-        d_clip = polyline_to_pathd(pts + [pts[0]])
-        ET.SubElement(cp, f"{{{SVG_NS}}}path", {"d": d_clip})
-        # lines group
-        g = ET.SubElement(parent_group, f"{{{SVG_NS}}}g", {
-            "clip-path": f"url(#{clip_id})",
-            "opacity": str(opacity),
-            "transform": f"rotate({angle_deg} {cx} {cy})"
-        })
-        rng = np.random.default_rng(seed_local)
-        # draw vertical lines covering bbox after rotation approx by margin
-        margin = max(spacing*2, 20)
-        x = minx - margin
-        xmax = maxx + margin
-        while x <= xmax:
-            dy = float(rng.normal(0, jitter_amt))
-            y1 = miny - margin + dy
-            y2 = maxy + margin + dy
-            ET.SubElement(g, f"{{{SVG_NS}}}line", {
-                "x1": str(x), "y1": str(y1), "x2": str(x), "y2": str(y2),
-                "stroke": color if color else "#000",
-                "stroke-width": "1.0"
-            })
-            x += spacing
-
-    # Traverse original elements
-    def process(el, parent_group):
-        for child in list(el):
-            tag = child.tag
-            if tag.endswith("defs"):
-                # copy defs as-is
-                parent_group.append(child)
-                continue
-            if len(list(child))>0:
-                # group-like: recurse into a new subgroup
-                subg = ET.SubElement(parent_group, f"{{{SVG_NS}}}g", child.attrib)
-                process(child, subg)
+            if local == "defs":
+                # Reprendre les defs originales
+                parent.append(child)
                 continue
 
-            # Only shape-like elements handled here
-            pts = element_to_polyline(child, density=density)
-            if not pts:
-                # copy unknowns as-is
-                parent_group.append(child)
+            # Si group, on recrée le groupe et on descend
+            if len(list(child)) > 0 and local not in SAFE_LEAF:
+                g = ET.SubElement(parent, child.tag, child.attrib)
+                walk(child, g)
                 continue
 
-            # original fill preserved (but remove stroke if we redraw it)
-            preserved = clone_without_stroke(child) if replace_strokes else ET.Element(child.tag, child.attrib)
-            parent_group.append(preserved)
+            if local in SAFE_LEAF:
+                # Base = duplication avec styles inline normalisés
+                base = duplicate_with_computed(child)
 
-            # choose stroke color/width
-            stroke_color = child.get("stroke")
-            fill_color = child.get("fill")
-            if (not stroke_color or stroke_color in ("none","transparent")) and fill_color and fill_color != "none":
-                stroke_color = darken_hex(fill_color, 0.8)
+                # Recoloration légère (HSL) des fills/strokes
+                # (conserve couleurs nommées inchangées)
+                fill = base.get("fill")
+                if fill and fill not in ("none", "transparent"):
+                    base.set("fill", shift_color(fill, dh=hue_shift, ds=sat_gain, dl=light_gain))
 
-            stroke_width = get_float(child, "stroke-width", 1.0) * stroke_gain
-            linecap = child.get("stroke-linecap","round")
-            linejoin = child.get("stroke-linejoin","round")
+                stroke = base.get("stroke")
+                had_stroke = (stroke and stroke not in ("none", "transparent"))
+                if had_stroke:
+                    # Augmenter un peu l'épaisseur pour que les passes croquis ressortent
+                    try:
+                        w = float(re.sub(r"[^0-9.+-eE]", "", base.get("stroke-width", "1") or "1"))
+                    except Exception:
+                        w = 1.0
+                    base.set("stroke-width", f"{w * stroke_gain:.3f}")
+                    base.set("stroke-linecap", base.get("stroke-linecap", "round"))
+                    base.set("stroke-linejoin", base.get("stroke-linejoin", "round"))
+                    base.set("stroke", shift_color(stroke, dh=hue_shift * 0.6, ds=sat_gain, dl=light_gain * 0.5))
 
-            # Build jittered polylines
-            base_pts = pts if anatomy_mode else overshoot_polyline(pts, amount=overshoot_amt)
-            j_amp1 = min(jitter, 0.6) if anatomy_mode else jitter
-            j_amp2 = min(jitter2, 0.4) if anatomy_mode else jitter2
-            j_amp3 = min(jitter3, 0.3) if anatomy_mode else jitter3
-            p1 = jitter_polyline(base_pts, amp=j_amp1, seed=seed, roughness=roughness)
-            p2 = jitter_polyline(base_pts, amp=j_amp2, seed=seed+1, roughness=roughness)
-            if smooth_passes>0:
-                p1 = chaikin_smooth(p1, passes=smooth_passes)
-                p2 = chaikin_smooth(p2, passes=smooth_passes)
+                # Appliquer un grain doux sur la base (aucune déformation)
+                base.set("filter", "url(#grain)")
 
-            d1 = polyline_to_pathd(p1); d2 = polyline_to_pathd(p2)
-            paths_ds = [d1, d2]
-            if enable_extra_pass:
-                p3 = jitter_polyline(base_pts, amp=j_amp3, seed=seed+2, roughness=roughness)
-                if smooth_passes>0:
-                    p3 = chaikin_smooth(p3, passes=smooth_passes)
-                d3 = polyline_to_pathd(p3)
-                paths_ds.append(d3)
+                # Option : remplacer complètement le trait original par les passes "croquis"
+                if replace_original_strokes and had_stroke:
+                    base.set("stroke", "none")
 
-            rng_local = np.random.default_rng(seed)
-            for d in paths_ds:
-                if not d:
-                    continue
-                this_stroke = stroke_color if stroke_color else "#000"
-                if color_jitter and not anatomy_mode and this_stroke and this_stroke != "none":
-                    this_stroke = jitter_hex_color(this_stroke, amount=int(color_jitter), rng=rng_local)
-                path = ET.SubElement(parent_group, f"{{{SVG_NS}}}path", {
-                    "d": d,
-                    "fill": "none",
-                    "stroke": this_stroke,
-                    "stroke-width": str(stroke_width * (1.0 + float(rng_local.normal(0, max(0.0, stroke_variation))))),
-                    "stroke-linecap": linecap,
-                    "stroke-linejoin": linejoin,
-                    "opacity": "0.95"
-                })
+                # Ajouter la base
+                parent.append(base)
 
-            # Optional hatching inside filled shapes
-            if enable_hatching and not anatomy_mode and fill_color and fill_color != "none" and is_closed_polyline(pts):
-                hatch_color = darken_hex(fill_color, 0.65) if fill_color else "#000"
-                add_hatching_for_points(parent_group, pts, hatch_color, hatch_spacing, hatch_angle, hatch_jitter, hatch_opacity, seed+11)
+                # Overlays croquis (multi-passes) si l'élément a un trait
+                # ou si c'est typiquement un contour (line/polyline/path)
+                overlay_needed = had_stroke or local in ("line", "polyline", "path")
+                if overlay_needed:
+                    # Choisir couleur d'overlay : stroke si présent, sinon fill
+                    overlay_color = stroke if had_stroke else base.get("fill")
+                    if not overlay_color or overlay_color in ("none", "transparent"):
+                        overlay_color = "#000"
+                    # Calcul largeur d'après base (si on a un stroke-width)
+                    try:
+                        w = float(re.sub(r"[^0-9.+-eE]", "", (child.get("stroke-width") or base.get("stroke-width") or "1")))
+                    except Exception:
+                        w = 1.0
+                    for ov in make_sketch_strokes(child, passes=int(passes), width=w * stroke_gain, seed=int(seed), stroke_color=overlay_color):
+                        parent.append(ov)
 
-            # Adjust fill/stroke colors slightly (not for black) in anatomy mode too
-            if fill_color and fill_color != "none" and not is_black(fill_color):
-                factor = 1.0 + (color_variation_fill if not anatomy_mode else (color_variation_fill*0.6)) * (1 if (seed % 2)==0 else -1)
-                preserved.set("fill", adjust_hex_lightness(fill_color, factor))
-            if stroke_color and stroke_color != "none" and not is_black(stroke_color):
-                factor_s = 1.0 + (color_variation_stroke if not anatomy_mode else (color_variation_stroke*0.6)) * (1 if (seed % 3)==0 else -1)
-                preserved.set("stroke", adjust_hex_lightness(stroke_color, factor_s))
+                # Hachures facultatives (strictement à l'intérieur de la forme)
+                if enable_hatching and base.get("fill") and base.get("fill") != "none":
+                    if local in SAFE_SHAPES_FOR_HATCH:
+                        add_hatching(defs, parent, child, spacing=hatch_spacing, angle=hatch_angle, opacity=hatch_opacity)
 
-    process(root, g_main)
+            else:
+                # Élément feuille inconnu : copie brute
+                parent.append(child)
+
+    walk(root, wrapper)
     return pretty(out).encode("utf-8")
 
-# ---------------------- Streamlit UI ----------------------
-st.set_page_config(page_title="Redessiner SVG — style main levée", page_icon="✏️", layout="wide")
-st.title("✏️ Redessiner un SVG en **style dessiné à la main** (couleurs intactes, anatomie préservée)")
+# --------------------- Streamlit UI ---------------------
 
-uploaded = st.file_uploader("Dépose un SVG", type=["svg"])
+st.set_page_config(page_title="SVG main-levée (anatomie safe)", page_icon="✏️", layout="wide")
+st.title("✏️ Redessiner un SVG — **style dessiné à la main** sans déformer les structures")
 
-c1,c2,c3 = st.columns(3)
+uploaded = st.file_uploader("Dépose ton fichier SVG", type=["svg"])
+
+c1, c2, c3 = st.columns(3)
 with c1:
-    density = st.slider("Densité (points / 100 px)", 0.5, 6.0, 1.8, 0.1, help="Résolution de l'échantillonnage des contours.")
-    smooth = st.slider("Lissage (passes Chaikin)", 0, 4, 2, 1, help="Plus lisse → plus 'feutre'. 0 conserve les aspérités.")
+    hue = st.slider("Décalage teinte (°)", -24, 24, 8, 1)
+    sat = st.slider("Gain saturation", -0.3, 0.3, 0.05, 0.01)
 with c2:
-    jitter = st.slider("Jitter principal (px)", 0.0, 8.0, 4.5, 0.1, help="Amplitude de la 1ère passe (effet visible).")
-    jitter2 = st.slider("Jitter secondaire (px)", 0.0, 6.0, 3.0, 0.1, help="Amplitude de la 2nde passe (double trait).")
+    light = st.slider("Gain luminosité", -0.3, 0.3, 0.02, 0.01)
+    passes = st.slider("Passes de trait (croquis)", 1, 3, 2, 1)
 with c3:
+    stroke_gain = st.slider("Épaisseur relative du trait", 0.5, 2.5, 1.2, 0.05)
     seed = st.number_input("Graine aléatoire", 0, 9999, 42, 1)
-    stroke_gain = st.slider("Épaisseur relative des traits", 0.5, 2.5, 1.15, 0.05)
-    replace_strokes = st.checkbox("Remplacer les traits originaux (recommandé)", True,
-                                  help="Sinon on superpose les traits redessinés par dessus.")
 
-with st.expander("Avancé"):
-    cA, cB, cC = st.columns(3)
-    with cA:
-        roughness = st.slider("Rugosité (bruit lissé)", 0.5, 3.0, 1.8, 0.1)
-        enable_extra_pass = st.checkbox("Activer une 3ᵉ passe", True)
-        jitter3 = st.slider("Jitter 3ᵉ passe (px)", 0.0, 6.0, 1.2, 0.1)
-        anatomy_mode = st.checkbox("Mode anatomie (préserver la géométrie)", True)
-    with cB:
-        color_jitter = st.slider("Variation couleur du trait", 0, 40, 10, 1,
-                                 help="Décalage aléatoire sur R/G/B (valeurs 0–255).")
-        overshoot_amt = st.slider("Overshoot (débord) des extrémités (px)", 0.0, 12.0, 6.0, 0.5)
-        stroke_variation = st.slider("Variation aléatoire d'épaisseur", 0.0, 0.6, 0.1, 0.02)
-    with cC:
-        enable_warp = st.checkbox("Déformer globalement (warp)", True)
-        warp_scale = st.slider("Intensité du warp", 0.0, 15.0, 6.0, 0.5)
-        warp_freq = st.slider("Fréquence du bruit", 0.002, 0.05, 0.012, 0.002)
-        warp_octaves = st.slider("Octaves du bruit", 1, 6, 3, 1)
-        enable_hatching = st.checkbox("Hachures internes (remplissages)", False)
-        hatch_spacing = st.slider("Espacement hachures (px)", 3.0, 20.0, 8.0, 0.5)
-        hatch_angle = st.slider("Angle hachures (°)", 0.0, 180.0, 45.0, 1.0)
-        hatch_jitter = st.slider("Jitter hachures (px)", 0.0, 4.0, 1.5, 0.1)
-        hatch_opacity = st.slider("Opacité hachures", 0.05, 0.6, 0.22, 0.01)
-        color_variation_fill = st.slider("Variation légère de fill", 0.0, 0.2, 0.08, 0.01)
-        color_variation_stroke = st.slider("Variation légère de stroke", 0.0, 0.2, 0.06, 0.01)
-    st.markdown("Paramètres par défaut optimisés pour un rendu non reconnaissable mais fidèle.")
+replace = st.checkbox("Remplacer le trait original (recommandé)", True,
+                      help="Supprime le stroke de base et ajoute 2–3 passes en pointillés par-dessus.")
+st.markdown("—")
+
+with st.expander("Options avancées"):
+    enable_hatching = st.checkbox("Hachures internes (optionnel)", False)
+    hatch_spacing = st.slider("Espacement des hachures (px)", 4.0, 20.0, 8.0, 0.5)
+    hatch_angle = st.slider("Angle des hachures (°)", 0.0, 180.0, 45.0, 1.0)
+    hatch_opacity = st.slider("Opacité des hachures", 0.05, 0.5, 0.18, 0.01)
+    grain_freq = st.slider("Grain – fréquence bruit", 0.2, 1.5, 0.8, 0.05)
+    grain_intensity = st.slider("Grain – intensité", 0.00, 0.20, 0.07, 0.01)
 
 if uploaded:
     raw = uploaded.read()
-    # fallback defaults if expander not opened (Streamlit keeps state but ensure names exist)
-    if 'roughness' not in locals():
-        roughness = 1.0; enable_extra_pass = True; jitter3 = 0.8
-        color_jitter = 8; overshoot_amt = 3.0
-        enable_warp = True; warp_scale = 3.0; warp_freq = 0.01; warp_octaves = 2
-        anatomy_mode = True; stroke_variation = 0.1
-        enable_hatching = False; hatch_spacing = 8.0; hatch_angle = 45.0; hatch_jitter = 1.5; hatch_opacity = 0.22
-        color_variation_fill = 0.08; color_variation_stroke = 0.06
+    out = process_svg(
+        raw,
+        hue_shift=float(hue),
+        sat_gain=float(sat),
+        light_gain=float(light),
+        passes=int(passes),
+        stroke_gain=float(stroke_gain),
+        replace_original_strokes=bool(replace),
+        seed=int(seed),
+        enable_hatching=bool(enable_hatching),
+        hatch_spacing=float(hatch_spacing),
+        hatch_angle=float(hatch_angle),
+        hatch_opacity=float(hatch_opacity),
+        grain_freq=float(grain_freq),
+        grain_intensity=float(grain_intensity),
+    )
 
-    out = redraw_svg(raw, density=density, jitter=jitter, jitter2=jitter2,
-                     smooth_passes=smooth, stroke_gain=stroke_gain,
-                     replace_strokes=replace_strokes, seed=int(seed),
-                     roughness=roughness, enable_extra_pass=enable_extra_pass, jitter3=jitter3,
-                     color_jitter=color_jitter, overshoot_amt=overshoot_amt,
-                     enable_warp=enable_warp, warp_scale=warp_scale, warp_freq=warp_freq, warp_octaves=warp_octaves,
-                     stroke_variation=stroke_variation,
-                     enable_hatching=enable_hatching, hatch_spacing=hatch_spacing, hatch_angle=hatch_angle, hatch_jitter=hatch_jitter, hatch_opacity=hatch_opacity,
-                     anatomy_mode=anatomy_mode, color_variation_fill=color_variation_fill, color_variation_stroke=color_variation_stroke)
-    st.download_button("⬇️ Télécharger le SVG redessiné", data=out, file_name="redessine.svg", mime="image/svg+xml")
+    st.download_button("⬇️ Télécharger le SVG redessiné (safe)", data=out,
+                       file_name="handdrawn_safe.svg", mime="image/svg+xml")
 
-    st.subheader("Avant / Après")
     colA, colB = st.columns(2)
     with colA:
         st.caption("Original")
-        st.markdown(f"<div style='border:1px solid #ddd;padding:8px'>{raw.decode('utf-8', errors='ignore')}</div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div style='border:1px solid #ddd;padding:6px;max-height:72vh;overflow:auto'>{raw.decode('utf-8', errors='ignore')}</div>",
+            unsafe_allow_html=True,
+        )
     with colB:
-        st.caption("Redessiné")
-        st.markdown(f"<div style='border:1px solid #ddd;padding:8px'>{out.decode('utf-8')}</div>", unsafe_allow_html=True)
-
-    st.markdown("---")
-    st.info("Astuce : augmente **Jitter principal** à 3–5 px pour un rendu très marqué. Le remplissage (fill) est conservé tel quel.")
+        st.caption("Redessiné (géométrie inchangée)")
+        st.markdown(
+            f"<div style='border:1px solid #ddd;padding:6px;max-height:72vh;overflow:auto'>{out.decode('utf-8')}</div>",
+            unsafe_allow_html=True,
+        )
 else:
-    st.info("Charge un fichier SVG. Le rendu 'main levée' remplace/ajoute les traits en double passe, mais **ne modifie pas** les couleurs ni les surfaces remplies.")
-
+    st.info("Charge un SVG. L’app décale légèrement les couleurs et superpose des traits en pointillés arrondis "
+            "pour un rendu 'dessiné à la main' **sans déplacer un seul point** du schéma.")
