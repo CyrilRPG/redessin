@@ -185,7 +185,7 @@ def make_smoothed_noise(N, roughness, rng):
     std = np.std(smooth) or 1.0
     return smooth / std
 
-def jitter_pair_polylines(points, amp=1.2, seed=42, roughness=1.0, stroke_width=1.0):
+def jitter_pair_polylines(points, amp=1.2, seed=42, roughness=1.0, stroke_width=1.0, rigor=0.75):
     """Return two polylines jittered symmetrically along normals (+d and -d),
     with displacement clamped to preserve geometry for anatomy diagrams.
     """
@@ -202,13 +202,68 @@ def jitter_pair_polylines(points, amp=1.2, seed=42, roughness=1.0, stroke_width=
     max_by_stroke = 0.6 * max(0.8, stroke_width)  # fraction of stroke width
     max_d = min(max_abs, max_by_len, max_by_stroke, amp)
 
+    weights = compute_geometry_weights(points, protect_angles=True, end_taper_frac=0.18)
     plus = []
     minus = []
-    for (x,y), (nx,ny), s in zip(points, norms, noise):
-        d = float(s) * max_d
+    for (x,y), (nx,ny), s, w in zip(points, norms, noise, weights):
+        # rigor in [0,1]: closer to 1 → stronger damping
+        damping = (rigor*0.85 + (1.0-rigor)*1.0)
+        d = float(s) * max_d * w * damping
         plus.append((x + d*nx, y + d*ny))
         minus.append((x - d*nx, y - d*ny))
     return plus, minus
+
+def compute_geometry_weights(points, protect_angles=True, end_taper_frac=0.15):
+    """Return per-point weights in [0,1] reducing jitter near corners, tiny segments and endpoints."""
+    N = len(points)
+    if N == 0:
+        return []
+    if N == 1:
+        return [1.0]
+    # segment lengths
+    seg_len = [0.0]*(N-1)
+    for i in range(N-1):
+        x1,y1 = points[i]; x2,y2 = points[i+1]
+        seg_len[i] = ((x2-x1)**2 + (y2-y1)**2) ** 0.5
+    Lavg = max(sum(seg_len)/max(1, len(seg_len)), 1e-6)
+    # angle changes (internal points)
+    ang = [0.0]*N
+    if protect_angles and N > 2:
+        for i in range(1, N-1):
+            ax = points[i][0] - points[i-1][0]; ay = points[i][1] - points[i-1][1]
+            bx = points[i+1][0] - points[i][0]; by = points[i+1][1] - points[i][1]
+            la = (ax*ax+ay*ay)**0.5 or 1.0
+            lb = (bx*bx+by*by)**0.5 or 1.0
+            ax/=la; ay/=la; bx/=lb; by/=lb
+            dot = max(-1.0, min(1.0, ax*bx + ay*by))
+            ang[i] = np.arccos(dot)  # radians
+    # build weights
+    weights = [1.0]*N
+    theta0 = np.deg2rad(25.0)
+    for i in range(N):
+        # length weight from adjacent segs
+        l_here = 0.0
+        if i>0:
+            l_here += seg_len[i-1]
+        if i < N-1:
+            l_here += seg_len[i]
+        l_here = l_here/ (2.0 if 0<i<N-1 else 1.0)
+        w_len = max(0.35, min(1.0, l_here / (0.7*Lavg)))
+        # angle weight (small near corners)
+        w_ang = 1.0
+        if protect_angles and 0<i<N-1:
+            a = abs(ang[i])
+            w_ang = 1.0 / (1.0 + (a/theta0)**2)
+            w_ang = max(0.25, min(1.0, w_ang))
+        weights[i] = min(1.0, w_len * w_ang)
+    # endpoint taper for open polylines
+    if N>2 and not is_closed_polyline(points):
+        k = max(1, int(end_taper_frac * N))
+        for i in range(min(k, N)):
+            t = (i+1)/float(k+1)
+            weights[i] *= t
+            weights[N-1-i] *= t
+    return weights
 
 def polyline_to_pathd(points):
     if not points:
@@ -433,7 +488,7 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
             linejoin = child.get("stroke-linejoin","round")
 
             # Build symmetric jittered polylines for geometry preservation
-            p1, p2 = jitter_pair_polylines(pts, amp=jitter, seed=seed, roughness=roughness, stroke_width=stroke_width)
+            p1, p2 = jitter_pair_polylines(pts, amp=jitter, seed=seed, roughness=roughness, stroke_width=stroke_width, rigor=0.85)
             if smooth_passes>0:
                 p1 = chaikin_smooth(p1, passes=smooth_passes)
                 p2 = chaikin_smooth(p2, passes=smooth_passes)
@@ -441,7 +496,7 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
             d1 = polyline_to_pathd(p1); d2 = polyline_to_pathd(p2)
             paths_ds = [d1, d2]
             if enable_extra_pass:
-                p3_plus, p3_minus = jitter_pair_polylines(pts, amp=max(0.25, min(jitter3, jitter*0.5)), seed=seed+2, roughness=roughness, stroke_width=stroke_width)
+                p3_plus, p3_minus = jitter_pair_polylines(pts, amp=max(0.25, min(jitter3, jitter*0.5)), seed=seed+2, roughness=roughness, stroke_width=stroke_width, rigor=0.9)
                 p3 = p3_plus if (seed % 2)==0 else p3_minus
                 if smooth_passes>0:
                     p3 = chaikin_smooth(p3, passes=smooth_passes)
@@ -501,6 +556,7 @@ with st.expander("Avancé"):
         enable_extra_pass = st.checkbox("Activer une 3ᵉ passe subtile", True)
         jitter3 = st.slider("Amplitude 3ᵉ passe (px)", 0.0, 2.0, 0.5, 0.1)
         stroke_variation = st.slider("Variation aléatoire d'épaisseur", 0.0, 0.4, 0.08, 0.02)
+        rigor = st.slider("Rigueur anatomique (anti-déformation)", 0.0, 1.0, 0.85, 0.01)
     with cB:
         color_variation_fill = st.slider("Variation légère du fill", 0.0, 0.2, 0.06, 0.01)
         color_variation_stroke = st.slider("Variation légère du stroke", 0.0, 0.2, 0.05, 0.01)
