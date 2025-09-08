@@ -632,12 +632,12 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=1.2, jitter2=0.8, smooth_passes
                 erode_id = ensure_erode_filter(defs, radius=max(0.0, float(inset_px))) if inset_px>0 else None
 
                 for d in paths_ds:
-                if not d:
-                    continue
+                    if not d:
+                        continue
                     this_stroke = stroke_color if stroke_color else "#000"
                     attribs = {
-                    "d": d,
-                    "fill": "none",
+                        "d": d,
+                        "fill": "none",
                         "stroke": this_stroke,
                         "stroke-width": str(stroke_width * (1.0 + float(rng_local.normal(0, max(0.0, stroke_variation))))),
                         "stroke-linecap": linecap,
