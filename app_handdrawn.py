@@ -219,6 +219,20 @@ def jitter_hex_color(color, amount=10, rng=None):
     r,g,b = rgb
     return rgb_to_hex((r+dr, g+dg, b+db))
 
+def is_black(color, threshold=10):
+    rgb = hex_to_rgb(color)
+    if rgb is None:
+        return False
+    return rgb[0] < threshold and rgb[1] < threshold and rgb[2] < threshold
+
+def adjust_hex_lightness(color, factor=1.0):
+    rgb = hex_to_rgb(color)
+    if rgb is None:
+        return color
+    r,g,b = rgb
+    r = clamp(r*factor); g = clamp(g*factor); b = clamp(b*factor)
+    return rgb_to_hex((r,g,b))
+
 # ---------------------- SVG processing ----------------------
 def element_to_polyline(el, density):
     tag = el.tag
@@ -324,7 +338,8 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=2.4, jitter2=1.2, smooth_passes
                roughness=1.0, enable_extra_pass=True, jitter3=0.8, color_jitter=8, overshoot_amt=3.0,
                enable_warp=True, warp_scale=3.0, warp_freq=0.01, warp_octaves=2,
                stroke_variation=0.1,
-               enable_hatching=False, hatch_spacing=8.0, hatch_angle=45.0, hatch_jitter=1.5, hatch_opacity=0.22):
+               enable_hatching=False, hatch_spacing=8.0, hatch_angle=45.0, hatch_jitter=1.5, hatch_opacity=0.22,
+               anatomy_mode=True, color_variation_fill=0.08, color_variation_stroke=0.06):
     # parse root
     try:
         root = ET.fromstring(svg_bytes)
@@ -340,10 +355,10 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=2.4, jitter2=1.2, smooth_passes
     out = ET.Element(root.tag, root.attrib)
     defs = ensure_defs(out)
     # Optionally add warp filter
-    if enable_warp and float(warp_scale) > 0:
+    if enable_warp and not anatomy_mode and float(warp_scale) > 0:
         add_sketch_filter(defs, base_freq=warp_freq, octaves=warp_octaves, warp_scale=warp_scale, seed=seed)
     g_main = ET.SubElement(out, f"{{{SVG_NS}}}g", {"id":"handdrawn"})
-    if enable_warp and float(warp_scale) > 0:
+    if enable_warp and not anatomy_mode and float(warp_scale) > 0:
         g_main.set("filter", "url(#sketch_warp)")
 
     # simple counter for unique ids
@@ -420,9 +435,12 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=2.4, jitter2=1.2, smooth_passes
             linejoin = child.get("stroke-linejoin","round")
 
             # Build jittered polylines
-            base_pts = overshoot_polyline(pts, amount=overshoot_amt)
-            p1 = jitter_polyline(base_pts, amp=jitter, seed=seed, roughness=roughness)
-            p2 = jitter_polyline(base_pts, amp=jitter2, seed=seed+1, roughness=roughness)
+            base_pts = pts if anatomy_mode else overshoot_polyline(pts, amount=overshoot_amt)
+            j_amp1 = min(jitter, 0.6) if anatomy_mode else jitter
+            j_amp2 = min(jitter2, 0.4) if anatomy_mode else jitter2
+            j_amp3 = min(jitter3, 0.3) if anatomy_mode else jitter3
+            p1 = jitter_polyline(base_pts, amp=j_amp1, seed=seed, roughness=roughness)
+            p2 = jitter_polyline(base_pts, amp=j_amp2, seed=seed+1, roughness=roughness)
             if smooth_passes>0:
                 p1 = chaikin_smooth(p1, passes=smooth_passes)
                 p2 = chaikin_smooth(p2, passes=smooth_passes)
@@ -430,7 +448,7 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=2.4, jitter2=1.2, smooth_passes
             d1 = polyline_to_pathd(p1); d2 = polyline_to_pathd(p2)
             paths_ds = [d1, d2]
             if enable_extra_pass:
-                p3 = jitter_polyline(base_pts, amp=jitter3, seed=seed+2, roughness=roughness)
+                p3 = jitter_polyline(base_pts, amp=j_amp3, seed=seed+2, roughness=roughness)
                 if smooth_passes>0:
                     p3 = chaikin_smooth(p3, passes=smooth_passes)
                 d3 = polyline_to_pathd(p3)
@@ -441,7 +459,7 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=2.4, jitter2=1.2, smooth_passes
                 if not d:
                     continue
                 this_stroke = stroke_color if stroke_color else "#000"
-                if color_jitter and this_stroke and this_stroke != "none":
+                if color_jitter and not anatomy_mode and this_stroke and this_stroke != "none":
                     this_stroke = jitter_hex_color(this_stroke, amount=int(color_jitter), rng=rng_local)
                 path = ET.SubElement(parent_group, f"{{{SVG_NS}}}path", {
                     "d": d,
@@ -454,9 +472,17 @@ def redraw_svg(svg_bytes, *, density=1.8, jitter=2.4, jitter2=1.2, smooth_passes
                 })
 
             # Optional hatching inside filled shapes
-            if enable_hatching and fill_color and fill_color != "none" and is_closed_polyline(pts):
+            if enable_hatching and not anatomy_mode and fill_color and fill_color != "none" and is_closed_polyline(pts):
                 hatch_color = darken_hex(fill_color, 0.65) if fill_color else "#000"
                 add_hatching_for_points(parent_group, pts, hatch_color, hatch_spacing, hatch_angle, hatch_jitter, hatch_opacity, seed+11)
+
+            # Adjust fill/stroke colors slightly (not for black) in anatomy mode too
+            if fill_color and fill_color != "none" and not is_black(fill_color):
+                factor = 1.0 + (color_variation_fill if not anatomy_mode else (color_variation_fill*0.6)) * (1 if (seed % 2)==0 else -1)
+                preserved.set("fill", adjust_hex_lightness(fill_color, factor))
+            if stroke_color and stroke_color != "none" and not is_black(stroke_color):
+                factor_s = 1.0 + (color_variation_stroke if not anatomy_mode else (color_variation_stroke*0.6)) * (1 if (seed % 3)==0 else -1)
+                preserved.set("stroke", adjust_hex_lightness(stroke_color, factor_s))
 
     process(root, g_main)
     return pretty(out).encode("utf-8")
@@ -486,15 +512,24 @@ with st.expander("Avancé"):
         roughness = st.slider("Rugosité (bruit lissé)", 0.5, 3.0, 1.8, 0.1)
         enable_extra_pass = st.checkbox("Activer une 3ᵉ passe", True)
         jitter3 = st.slider("Jitter 3ᵉ passe (px)", 0.0, 6.0, 1.2, 0.1)
+        anatomy_mode = st.checkbox("Mode anatomie (préserver la géométrie)", True)
     with cB:
         color_jitter = st.slider("Variation couleur du trait", 0, 40, 10, 1,
                                  help="Décalage aléatoire sur R/G/B (valeurs 0–255).")
         overshoot_amt = st.slider("Overshoot (débord) des extrémités (px)", 0.0, 12.0, 6.0, 0.5)
+        stroke_variation = st.slider("Variation aléatoire d'épaisseur", 0.0, 0.6, 0.1, 0.02)
     with cC:
         enable_warp = st.checkbox("Déformer globalement (warp)", True)
         warp_scale = st.slider("Intensité du warp", 0.0, 15.0, 6.0, 0.5)
         warp_freq = st.slider("Fréquence du bruit", 0.002, 0.05, 0.012, 0.002)
         warp_octaves = st.slider("Octaves du bruit", 1, 6, 3, 1)
+        enable_hatching = st.checkbox("Hachures internes (remplissages)", False)
+        hatch_spacing = st.slider("Espacement hachures (px)", 3.0, 20.0, 8.0, 0.5)
+        hatch_angle = st.slider("Angle hachures (°)", 0.0, 180.0, 45.0, 1.0)
+        hatch_jitter = st.slider("Jitter hachures (px)", 0.0, 4.0, 1.5, 0.1)
+        hatch_opacity = st.slider("Opacité hachures", 0.05, 0.6, 0.22, 0.01)
+        color_variation_fill = st.slider("Variation légère de fill", 0.0, 0.2, 0.08, 0.01)
+        color_variation_stroke = st.slider("Variation légère de stroke", 0.0, 0.2, 0.06, 0.01)
     st.markdown("Paramètres par défaut optimisés pour un rendu non reconnaissable mais fidèle.")
 
 if uploaded:
@@ -504,13 +539,19 @@ if uploaded:
         roughness = 1.0; enable_extra_pass = True; jitter3 = 0.8
         color_jitter = 8; overshoot_amt = 3.0
         enable_warp = True; warp_scale = 3.0; warp_freq = 0.01; warp_octaves = 2
+        anatomy_mode = True; stroke_variation = 0.1
+        enable_hatching = False; hatch_spacing = 8.0; hatch_angle = 45.0; hatch_jitter = 1.5; hatch_opacity = 0.22
+        color_variation_fill = 0.08; color_variation_stroke = 0.06
 
     out = redraw_svg(raw, density=density, jitter=jitter, jitter2=jitter2,
                      smooth_passes=smooth, stroke_gain=stroke_gain,
                      replace_strokes=replace_strokes, seed=int(seed),
                      roughness=roughness, enable_extra_pass=enable_extra_pass, jitter3=jitter3,
                      color_jitter=color_jitter, overshoot_amt=overshoot_amt,
-                     enable_warp=enable_warp, warp_scale=warp_scale, warp_freq=warp_freq, warp_octaves=warp_octaves)
+                     enable_warp=enable_warp, warp_scale=warp_scale, warp_freq=warp_freq, warp_octaves=warp_octaves,
+                     stroke_variation=stroke_variation,
+                     enable_hatching=enable_hatching, hatch_spacing=hatch_spacing, hatch_angle=hatch_angle, hatch_jitter=hatch_jitter, hatch_opacity=hatch_opacity,
+                     anatomy_mode=anatomy_mode, color_variation_fill=color_variation_fill, color_variation_stroke=color_variation_stroke)
     st.download_button("⬇️ Télécharger le SVG redessiné", data=out, file_name="redessine.svg", mime="image/svg+xml")
 
     st.subheader("Avant / Après")
