@@ -435,6 +435,9 @@ def normalize_node(el: ET.Element):
     return el
 
 # ---------------------- SVG processing ----------------------
+def element_to_polyline(el, density):
+    # Stub kept for backward-compat in processing pipeline; geometry is not sampled in anatomy mode
+    return []
 ALLOWED_TAGS = ("path","line","polyline","polygon","rect","circle","ellipse")
 EXCLUDED_TAGS = ("text","tspan","image","marker","symbol")
 
@@ -779,4 +782,3 @@ if uploaded:
             st.caption("Audit désactivé: CairoSVG non installé sur cet environnement.")
 else:
     st.info("Charge un fichier SVG. Le rendu 'main levée' remplace/ajoute les traits en double passe, mais **ne modifie pas** les couleurs ni les surfaces remplies.")
-
