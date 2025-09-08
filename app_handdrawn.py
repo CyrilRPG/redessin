@@ -20,7 +20,6 @@ from xml.etree import ElementTree as ET
 from xml.dom import minidom
 import numpy as np
 from math import cos, sin, pi
-from svgpathtools import parse_path, Path as SvgPath
 import re
 import io
 import random
@@ -38,7 +37,7 @@ XLINK_NS = "http://www.w3.org/1999/xlink"
 ET.register_namespace("", SVG_NS)
 ET.register_namespace("xlink", XLINK_NS)
 
-# ---------------------- Geometry helpers ----------------------
+# ---------------------- Helpers ----------------------
 def pretty(elem):
     return minidom.parseString(ET.tostring(elem, encoding="utf-8")).toprettyxml(indent="  ")
 
@@ -67,25 +66,7 @@ def parse_points(points_str):
             break
     return pts
 
-def sample_svgpath_to_polyline(d, density=1.5):
-    """Sample a path 'd' into polyline points.
-    density: points per 100px of length (>= 0.5)"""
-    try:
-        p = parse_path(d)
-    except Exception:
-        return []
-    L = p.length()
-    if L == 0:
-        return []
-    n = max(int((L/100.0) * max(0.5, density)), 8)
-    # Use arclength parameterization for uniform sampling
-    pts = []
-    for i in range(n+1):
-        s = (L * i) / n
-        t = p.ilength(s)
-        z = p.point(t)
-        pts.append((z.real, z.imag))
-    return pts
+# No path sampling/jitter in anatomy mode. We keep geometry intact.
 
 def circle_points(cx, cy, r, n=120):
     return [(cx + r*cos(2*pi*i/n), cy + r*sin(2*pi*i/n)) for i in range(n+1)]
@@ -432,34 +413,30 @@ def diff_heatmap(orig_svg: bytes, new_svg: bytes, scale=2.0):
     blended.save(buf, format='PNG')
     return buf.getvalue(), stats
 
+# ---------------------- Style normalization ----------------------
+def parse_style_attr(style_str):
+    if not style_str:
+        return {}
+    out = {}
+    for part in style_str.split(';'):
+        if ':' in part:
+            k,v = part.split(':',1)
+            out[k.strip()] = v.strip()
+    return out
+
+def normalize_node(el: ET.Element):
+    # Merge style attribute into explicit attributes; do not touch geometry or transforms
+    style = parse_style_attr(el.get('style'))
+    for k,v in style.items():
+        if k not in el.attrib:
+            el.set(k, v)
+    if 'style' in el.attrib:
+        del el.attrib['style']
+    return el
+
 # ---------------------- SVG processing ----------------------
-def element_to_polyline(el, density):
-    tag = el.tag
-    if tag.endswith("path"):
-        d = el.get("d", "")
-        return sample_svgpath_to_polyline(d, density=density)
-    elif tag.endswith("polyline") or tag.endswith("polygon"):
-        pts = parse_points(el.get("points", ""))
-        if tag.endswith("polygon") and pts:
-            pts = pts + [pts[0]]
-        return pts
-    elif tag.endswith("line"):
-        x1 = get_float(el, "x1"); y1 = get_float(el, "y1")
-        x2 = get_float(el, "x2"); y2 = get_float(el, "y2")
-        return [(x1,y1),(x2,y2)]
-    elif tag.endswith("rect"):
-        x = get_float(el,"x"); y=get_float(el,"y")
-        w = get_float(el,"width"); h=get_float(el,"height")
-        rx = get_float(el,"rx",0.0); ry=get_float(el,"ry",0.0)
-        return rect_points(x,y,w,h,rx,ry)
-    elif tag.endswith("circle"):
-        cx = get_float(el,"cx"); cy=get_float(el,"cy"); r=get_float(el,"r")
-        return circle_points(cx,cy,r)
-    elif tag.endswith("ellipse"):
-        cx = get_float(el,"cx"); cy=get_float(el,"cy"); rx=get_float(el,"rx"); ry=get_float(el,"ry")
-        return ellipse_points(cx,cy,rx,ry)
-    else:
-        return []
+ALLOWED_TAGS = ("path","line","polyline","polygon","rect","circle","ellipse")
+EXCLUDED_TAGS = ("text","tspan","image","marker","symbol")
 
 def clone_without_stroke(el):
     c = ET.Element(el.tag, el.attrib)
@@ -468,6 +445,17 @@ def clone_without_stroke(el):
         c.set("data-original-stroke", c.get("stroke"))
         c.set("stroke", "none")
     return c
+
+def overlay_clone(el, overrides: dict):
+    dup = ET.Element(el.tag, el.attrib)
+    # Never change geometry or transform; only style attributes
+    for k,v in overrides.items():
+        if v is None:
+            if k in dup.attrib:
+                del dup.attrib[k]
+        else:
+            dup.set(k, str(v))
+    return dup
 
 def is_closed_polyline(points, eps=1e-3):
     if not points:
@@ -512,6 +500,46 @@ def ensure_erode_filter(defs, radius=0.4):
         "radius": str(radius)
     })
     return fid
+
+def ensure_grain_filter(defs, intensity=0.07, seed=0):
+    fid = f"grain_{str(intensity).replace('.', '_')}_{seed}"
+    for f in defs.findall(f".//{{{SVG_NS}}}filter"):
+        if f.get('id') == fid:
+            return fid
+    filt = ET.SubElement(defs, f"{{{SVG_NS}}}filter", {"id": fid, "x":"-10%","y":"-10%","width":"120%","height":"120%"})
+    ET.SubElement(filt, f"{{{SVG_NS}}}feTurbulence", {
+        "type": "fractalNoise",
+        "baseFrequency": "0.8",
+        "numOctaves": "1",
+        "seed": str(seed),
+        "result": "noise"
+    })
+    ET.SubElement(filt, f"{{{SVG_NS}}}feColorMatrix", {
+        "type": "saturate",
+        "values": "0",
+        "in": "noise",
+        "result": "noise_gray"
+    })
+    # Composite noise onto alpha only
+    ET.SubElement(filt, f"{{{SVG_NS}}}feComponentTransfer", {
+        "in": "noise_gray",
+        "result": "noise_scaled"
+    })
+    ET.SubElement(filt, f"{{{SVG_NS}}}feComposite", {
+        "in": "SourceGraphic",
+        "in2": "noise_scaled",
+        "operator": "arithmetic",
+        "k1": "0",
+        "k2": "1",
+        "k3": str(intensity),
+        "k4": "0"
+    })
+    return fid
+
+def random_dasharray(rng, base=6.0, jitter=0.4):
+    a = base * max(0.2, 1.0 + jitter * rng.normal(0,1))
+    b = base * max(0.2, 0.7 + jitter * rng.normal(0,1))
+    return f"{a:.2f},{b:.2f}"
 
 def add_sketch_filter(defs, *, base_freq=0.012, octaves=2, warp_scale=4.0, seed=0, saturation=1.0, contrast=1.0):
     filt = ET.SubElement(defs, f"{{{SVG_NS}}}filter", {"id": "sketch_warp"})
