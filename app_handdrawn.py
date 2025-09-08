@@ -16,6 +16,7 @@ NB : On évite toute modification destructive des surfaces remplies (fill), afin
 d'erreur anatomique. Les traits sont clairement différents de l'original (visuellement 'main levée').
 """
 import streamlit as st
+import streamlit.components.v1 as components
 from xml.etree import ElementTree as ET
 from xml.dom import minidom
 import numpy as np
@@ -710,6 +711,14 @@ with st.expander("Avancé"):
         inset_px = st.slider("Inset (érosion clip interne, px)", 0.0, 1.5, 0.4, 0.05)
     st.markdown("Mode Anatomie: jitter symétrique conscient de la géométrie; couleurs ajustées en OKLCH.")
 
+with st.expander("Rough.js (client) — rendu sans modifier la géométrie"):
+    use_rough = st.checkbox("Utiliser Rough.js pour les overlays (client)", True)
+    bowing = st.slider("Bowing", 0.0, 3.0, 0.8, 0.1)
+    roughness_opt = st.slider("Roughness", 0.0, 5.0, 1.5, 0.1)
+    hachure_gap = st.slider("Hachure gap", 2.0, 16.0, 6.0, 0.5)
+    hachure_angle = st.slider("Hachure angle", -180.0, 180.0, 0.0, 1.0)
+    stroke_mult = st.slider("Multiplier épaisseur", 0.5, 2.5, 1.2, 0.05)
+
 if uploaded:
     raw = uploaded.read()
     # fallback defaults if expander not opened (Streamlit keeps state but ensure names exist)
@@ -727,6 +736,33 @@ if uploaded:
                      color_variation_fill=color_variation_fill, color_variation_stroke=color_variation_stroke,
                      min_deltaE=min_deltaE, color_strength=color_strength, inset_px=inset_px)
     st.download_button("⬇️ Télécharger le SVG redessiné", data=out, file_name="redessine.svg", mime="image/svg+xml")
+
+    if use_rough:
+        # Render with Rough.js client-side to get a visible hand-drawn look without changing geometry
+        svg_html = raw.decode('utf-8', errors='ignore')
+        rough_html = f"""
+<div id='rough-container' style='border:1px solid #ddd;padding:8px;max-height:70vh;overflow:auto'></div>
+<script src="https://unpkg.com/roughjs@4.5.2/bundled/rough.cjs.js"></script>
+<script>
+  const src = `{svg_html.replace('`','\`')}`;
+  const container = document.getElementById('rough-container');
+  container.innerHTML = src;
+  const svg = container.querySelector('svg');
+  const rc = roughjs.svg(svg);
+  const elements = Array.from(svg.querySelectorAll('path, line, polyline, polygon, rect, circle, ellipse'));
+  elements.forEach(el => {
+    const style = window.getComputedStyle(el);
+    const stroke = el.getAttribute('stroke') || style.stroke || '#000';
+    const sw = parseFloat(el.getAttribute('stroke-width') || style.strokeWidth || '1') * {stroke_mult};
+    const opts = {{ roughness: {roughness_opt}, bowing: {bowing}, hachureGap: {hachure_gap}, hachureAngle: {hachure_angle}, stroke: stroke, strokeWidth: sw, fill: 'none' }};
+    try {{
+      const node = rc.path(el.getAttribute('d') || '', opts);
+      if (node) el.parentNode.insertBefore(node, el.nextSibling);
+    }} catch(e) {{}}
+  });
+</script>
+        """
+        components.html(rough_html, height=600, scrolling=True)
 
     st.subheader("Avant / Après")
     colA, colB = st.columns(2)
